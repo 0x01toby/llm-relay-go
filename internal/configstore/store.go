@@ -18,8 +18,8 @@ import (
 	"errors"
 	"sync/atomic"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/singleflight"
+	"gorm.io/gorm"
 
 	"github.com/taozhang/llmrelay/internal/repo"
 )
@@ -157,9 +157,9 @@ func NewStore(providerRepo *repo.ProviderRepo, aliasRepo *repo.AliasRepo) *Store
 	return s
 }
 
-// NewStoreForPool is a convenience that builds the repos from a pool.
-func NewStoreForPool(pool *pgxpool.Pool) *Store {
-	return NewStore(repo.NewProviderRepo(pool), repo.NewAliasRepo(pool))
+// NewStoreForDB is a convenience that builds the repos from a *gorm.DB.
+func NewStoreForDB(gdb *gorm.DB) *Store {
+	return NewStore(repo.NewProviderRepo(gdb), repo.NewAliasRepo(gdb))
 }
 
 // Snapshot returns the current cached snapshot. It may be empty if loading

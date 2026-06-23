@@ -141,9 +141,46 @@ TEST_DATABASE_URL="postgresql://lrs:lrs@127.0.0.1:5433/lrs_test" \
   go test ./internal/repo/ -tags integration -v
 ```
 
-Integration tests use a build tag (`integration`) and skip automatically when
-`TEST_DATABASE_URL` is unset, so the default `go test ./...` never fails for
-lack of a database.
+Integration tests use a build tag (`integration`) and are table-driven across
+every configured database dialect. Each dialect is enabled by an env var, and
+SQLite always runs (a temp file, no external service). Run against all three:
+
+```bash
+# Start optional Postgres + MySQL containers for full dialect coverage.
+docker run -d --rm --name lrs-test-pg -e POSTGRES_USER=lrs -e POSTGRES_PASSWORD=lrs \
+  -e POSTGRES_DB=lrs_test -p 5433:5432 postgres:17-alpine
+docker run -d --rm --name lrs-test-mysql -e MYSQL_ROOT_PASSWORD=lrs -e MYSQL_DATABASE=lrs_test \
+  -e MYSQL_USER=lrs -e MYSQL_PASSWORD=lrs -p 3307:3306 mysql:8.4
+
+TEST_DATABASE_URL="postgresql://lrs:lrs@127.0.0.1:5433/lrs_test" \
+TEST_MYSQL_URL="mysql://lrs:lrs@tcp(127.0.0.1:3307)/lrs_test" \
+  go test -p 1 -tags integration ./internal/repo/ ./internal/consoleapi/ -v
+```
+
+`TEST_SQLITE_URL` defaults to a temp file (omit it). Use `-p 1` when multiple
+packages share a test database so resets don't race.
+
+## Multiple database backends
+
+The gateway supports **PostgreSQL, MySQL, and SQLite** through GORM. The
+dialect is auto-detected from the `DATABASE_URL` scheme, so the same binary
+works against any backend with no code change:
+
+```bash
+# PostgreSQL
+DATABASE_URL=postgresql://user:pass@host:5432/db ./llm-relay
+
+# MySQL
+DATABASE_URL=mysql://user:pass@tcp(host:3306)/db ./llm-relay
+
+# SQLite (single file, zero-config — great for local/single-node deploys)
+DATABASE_URL=sqlite:///data/lrs.db ./llm-relay
+```
+
+Schema is managed by GORM `AutoMigrate` (additive: creates tables/indexes,
+never drops columns), which is dialect-agnostic. The `/health` endpoint and the
+dashboard's usage page report the active backend. Note: SQLite uses a pure-Go
+driver (`glebarez/sqlite`), so the build stays CGO-free (`CGO_ENABLED=0`).
 
 ## Run the spike
 

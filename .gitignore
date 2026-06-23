@@ -11,9 +11,18 @@
 /bin/
 /dist/
 *.exe
+# Vendored deps are not committed; Dockerfile uses `go mod download`.
+/vendor/
 
 # Test cache
 /tmp/
+# Playwright / test artifacts
+web/dashboard/test-results/
+web/dashboard/playwright-report/
+web/dashboard/blob-report/
+*.db
+*.sqlite
+*.sqlite3
 
 # Node / frontend
 web/dashboard/node_modules/

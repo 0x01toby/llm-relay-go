@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/taozhang/llmrelay/internal/consolestore"
+	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // handleRequestDetailFull assembles the full request-detail response the
@@ -39,18 +39,18 @@ func (a *API) handleRequestDetailFull(w http.ResponseWriter, r *http.Request, id
 	writeJSON(w, http.StatusOK, out)
 }
 
-// buildDetailRecord converts a DetailRow into the nested record shape DetailView
-// reads. It assembles response_timing (latencies) and response_usage (tokens)
-// from the flat DB columns, and decodes the *_headers_json / *_summary_json
-// blobs.
-func buildDetailRecord(row consolestore.DetailRow) obj {
+// buildDetailRecord converts a ConsoleRequest row into the nested record shape
+// DetailView reads. It assembles response_timing (latencies) and response_usage
+// (tokens) from the flat DB columns, and decodes the *_headers_json /
+// *_summary_json blobs.
+func buildDetailRecord(row schema.ConsoleRequest) obj {
 	timing := obj{
 		"first_chunk_latency_ms": deltaMs(row.CreatedAt, row.FirstChunkAt),
 		"first_token_latency_ms": deltaMs(row.CreatedAt, row.FirstTokenAt),
 		"duration_ms":            deltaMs(row.CreatedAt, row.CompletedAt),
 		"generation_duration_ms": generationDurationMs(row.FirstTokenAt, row.CompletedAt),
 		"response_body_bytes":    row.ResponseBodyBytes,
-		"has_streaming_content":  row.HasStreamingContent,
+		"has_streaming_content":  row.HasStreamingContent != 0,
 	}
 
 	usage := buildUsage(row)
@@ -64,59 +64,59 @@ func buildDetailRecord(row consolestore.DetailRow) obj {
 	}
 
 	return obj{
-		"request_id":              row.RequestID,
-		"created_at":              row.CreatedAt,
-		"route_prefix":            row.RoutePrefix,
-		"upstream_type":           row.UpstreamType,
-		"source_request_type":     row.SourceRequestType,
-		"client_label":            clientLabel(row.APIKeyName),
-		"api_key_id":              row.APIKeyID,
-		"api_key_name":            row.APIKeyName,
-		"path":                    row.Path,
-		"target_url":              row.TargetURL,
-		"request_model":           row.RequestModel,
-		"response_status":         row.ResponseStatus,
-		"response_status_text":    strOrDefault(row.ResponseStatusText, ""),
-		"response_timing":         timing,
-		"response_usage":          usage,
-		"response_payload":        strOrDefault(row.ResponsePayload, ""),
-		"response_payload_truncated":             row.ResponseTruncated,
-		"response_payload_truncation_reason":     row.ResponseTruncReason,
-		"original_payload":                       strOrDefault(row.OriginalPayload, ""),
-		"original_payload_truncated":             row.OriginalTruncated,
-		"forwarded_payload":                      strOrDefault(row.ForwardedPayload, ""),
-		"forwarded_payload_truncated":            row.ForwardedTruncated,
-		"original_headers":                       decodeJSONObj(row.OriginalHeadersJSON),
-		"forward_headers":                        decodeJSONObj(row.ForwardHeadersJSON),
-		"response_headers":                       decodeJSONObj(row.ResponseHeadersJSON),
-		"forwarded_summary":                      decodeJSONObj(row.ForwardedSummaryJSON),
-		"analysis":                               analyzeRequest(row),
-		"failover_from":                          row.FailoverFrom,
-		"failover_chain":                         failoverChain,
-		"original_route_prefix":                  row.OriginalRoutePrefix,
-		"original_request_model":                 row.OriginalRequestModel,
-		"failover_reason":                        row.FailoverReason,
-		"retry_attempt":                          row.RetryAttempt,
+		"request_id":                         row.RequestID,
+		"created_at":                         row.CreatedAt,
+		"route_prefix":                       row.RoutePrefix,
+		"upstream_type":                      row.UpstreamType,
+		"source_request_type":                row.SourceRequestType,
+		"client_label":                       clientLabel(row.APIKeyName),
+		"api_key_id":                         row.APIKeyID,
+		"api_key_name":                       row.APIKeyName,
+		"path":                               row.Path,
+		"target_url":                         row.TargetURL,
+		"request_model":                      row.RequestModel,
+		"response_status":                    row.ResponseStatus,
+		"response_status_text":               strOrDefault(row.ResponseStatusText, ""),
+		"response_timing":                    timing,
+		"response_usage":                     usage,
+		"response_payload":                   strOrDefault(row.ResponsePayload, ""),
+		"response_payload_truncated":         row.ResponsePayloadTruncated != 0,
+		"response_payload_truncation_reason": row.ResponsePayloadTruncationReason,
+		"original_payload":                   strOrDefault(row.OriginalPayload, ""),
+		"original_payload_truncated":         row.OriginalPayloadTruncated != 0,
+		"forwarded_payload":                  strOrDefault(row.ForwardedPayload, ""),
+		"forwarded_payload_truncated":        row.ForwardedPayloadTruncated != 0,
+		"original_headers":                   decodeJSONObj(row.OriginalHeadersJSON),
+		"forward_headers":                    decodeJSONObj(row.ForwardHeadersJSON),
+		"response_headers":                   decodeJSONObj(row.ResponseHeadersJSON),
+		"forwarded_summary":                  decodeJSONObj(row.ForwardedSummaryJSON),
+		"analysis":                           analyzeRequest(row),
+		"failover_from":                      row.FailoverFrom,
+		"failover_chain":                     failoverChain,
+		"original_route_prefix":              row.OriginalRoutePrefix,
+		"original_request_model":             row.OriginalRequestModel,
+		"failover_reason":                    row.FailoverReason,
+		"retry_attempt":                      row.RetryAttempt,
 	}
 }
 
-// buildUsage assembles the response_usage object from the token columns. Field
-// names mirror ConsoleResponseUsage in the dashboard.
-func buildUsage(row consolestore.DetailRow) obj {
+// buildUsage assembles the response_usage object from the token columns.
+func buildUsage(row schema.ConsoleRequest) obj {
+	cachedInput := row.CachedInputTokens
 	u := obj{
-		"input_tokens":                   row.InputTokens,
-		"output_tokens":                  row.OutputTokens,
-		"total_tokens":                   row.TotalTokens,
-		"cache_creation_input_tokens":    row.CacheCreationTokens,
-		"cache_read_input_tokens":        row.CacheReadTokens,
-		"cached_input_tokens":            row.CachedInputTokens,
-		"reasoning_output_tokens":        row.ReasoningOutputTokens,
-		"uncached_input_tokens":          row.InputTokens - row.CachedInputTokens,
-		"total_input_tokens":             row.InputTokens,
-		"total_output_tokens":            row.OutputTokens,
-		"total_cache_creation_tokens":    row.CacheCreationTokens,
-		"total_cache_read_tokens":        row.CacheReadTokens,
-		"estimated":                      row.UsageEstimated,
+		"input_tokens":                row.InputTokens,
+		"output_tokens":               row.OutputTokens,
+		"total_tokens":                row.TotalTokens,
+		"cache_creation_input_tokens": row.CacheCreationInputTokens,
+		"cache_read_input_tokens":     row.CacheReadInputTokens,
+		"cached_input_tokens":         row.CachedInputTokens,
+		"reasoning_output_tokens":     row.ReasoningOutputTokens,
+		"uncached_input_tokens":       row.InputTokens - cachedInput,
+		"total_input_tokens":          row.InputTokens,
+		"total_output_tokens":         row.OutputTokens,
+		"total_cache_creation_tokens": row.CacheCreationInputTokens,
+		"total_cache_read_tokens":     row.CacheReadInputTokens,
+		"estimated":                   row.TokenUsageEstimated != 0,
 	}
 	if row.ResponseModel != nil {
 		u["model"] = *row.ResponseModel
@@ -128,14 +128,13 @@ func buildUsage(row consolestore.DetailRow) obj {
 }
 
 // analyzeRequest builds the ConsoleAnalysis { cache_state, summary } shown in
-// the detail header badge. cache_state reflects whether the request hit cache;
-// summary is a short human description.
-func analyzeRequest(row consolestore.DetailRow) obj {
+// the detail header badge.
+func analyzeRequest(row schema.ConsoleRequest) obj {
 	cacheState := "none"
 	switch {
-	case row.CacheReadTokens > 0:
+	case row.CacheReadInputTokens > 0:
 		cacheState = "hit"
-	case row.CacheCreationTokens > 0:
+	case row.CacheCreationInputTokens > 0:
 		cacheState = "write"
 	}
 
@@ -158,8 +157,7 @@ func analyzeRequest(row consolestore.DetailRow) obj {
 	}
 }
 
-// deltaMs returns the ms difference between start and end (nil-aware). Used for
-// the timing fields.
+// deltaMs returns the ms difference between start and end (nil-aware).
 func deltaMs(start int64, end *int64) *int64 {
 	if end == nil {
 		return nil
@@ -208,7 +206,6 @@ func decodeJSONObj(raw *string) obj {
 }
 
 func itoa(n int) string {
-	// Avoid importing strconv just for this; format via the existing json path.
 	b, _ := json.Marshal(n)
 	return string(b)
 }

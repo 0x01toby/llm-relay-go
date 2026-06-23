@@ -82,7 +82,7 @@ func (a *API) handleProviderTest(w http.ResponseWriter, r *http.Request, channel
 		body.Model = defaultModelForType(target.Type)
 	}
 
-	result := probeUpstream(r.Context(), target, body.Model, a.pool)
+	result := probeUpstream(target, body.Model)
 	writeJSON(w, http.StatusOK, obj{
 		"status":      result.Status,
 		"statusCode":  result.StatusCode,
@@ -109,7 +109,7 @@ func (a *API) handleProviderUpstreamModels(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, obj{"error": "渠道未配置认证信息"})
 		return
 	}
-	models, httpErr := listUpstreamModels(r.Context(), target)
+	models, httpErr := listUpstreamModels(target)
 	if httpErr != nil {
 		writeJSON(w, httpErr.status, obj{"error": httpErr.message})
 		return
@@ -152,7 +152,7 @@ func (a *API) handleUpstreamModelsPreview(w http.ResponseWriter, r *http.Request
 	if target.AuthHeader == "" {
 		target.AuthHeader = defaultAuthHeader(target.Type)
 	}
-	models, httpErr := listUpstreamModels(r.Context(), target)
+	models, httpErr := listUpstreamModels(target)
 	if httpErr != nil {
 		writeJSON(w, httpErr.status, obj{"error": httpErr.message})
 		return
@@ -264,7 +264,7 @@ func buildProbeRequest(target upstreamTarget, model string) (*http.Request, erro
 // 4xx that is not an auth error counts as "reachable" — the point of the test
 // is to confirm the endpoint exists and the key works, not that the probe
 // succeeded semantically (max_tokens=1 will often return a real completion).
-func probeUpstream(ctx interface{ Done() <-chan struct{} }, target upstreamTarget, model string, _ interface{}) testProviderResponse {
+func probeUpstream(target upstreamTarget, model string) testProviderResponse {
 	req, err := buildProbeRequest(target, model)
 	if err != nil {
 		return testProviderResponse{Status: "error", StatusCode: 0, Message: "无法构造请求: " + err.Error()}
@@ -312,8 +312,8 @@ func probeUpstream(ctx interface{ Done() <-chan struct{} }, target upstreamTarge
 
 // listUpstreamModels fetches the upstream's model list. OpenAI providers are
 // queried via GET /models; Anthropic has no public list endpoint, so we fall
-// back to the saved models_json (this mirrors the original service's behavior).
-func listUpstreamModels(ctx interface{ Done() <-chan struct{} }, target upstreamTarget) ([]obj, *httpError) {
+// back to a stable hint set (this mirrors the original service's behavior).
+func listUpstreamModels(target upstreamTarget) ([]obj, *httpError) {
 	if target.Type == configstore.Anthropic {
 		// No standard Anthropic models-list endpoint; return a stable hint set.
 		return []obj{

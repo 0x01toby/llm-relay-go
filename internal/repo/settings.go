@@ -4,44 +4,48 @@ import (
 	"context"
 	"errors"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // SettingsRepo owns the gateway_settings table (key/value JSON store).
 type SettingsRepo struct {
-	pool *pgxpool.Pool
+	db *gorm.DB
 }
 
-// NewSettingsRepo builds a SettingsRepo against pool.
-func NewSettingsRepo(pool *pgxpool.Pool) *SettingsRepo { return &SettingsRepo{pool: pool} }
+// NewSettingsRepo builds a SettingsRepo against gdb.
+func NewSettingsRepo(gdb *gorm.DB) *SettingsRepo { return &SettingsRepo{db: gdb} }
 
-// Get loads the JSON value for a settings key. Returns ("", nil, ErrNotFound)
+// Get loads the JSON value for a settings key. Returns ("", 0, ErrNotFound)
 // when the key is absent (the caller treats absence as "use defaults").
+//
+// Note: `key` is a reserved word in MySQL, so we build the WHERE clause via
+// GORM's clause package so the column is quoted per-dialect (mysql uses
+// backticks; postgres/sqlite use double quotes).
 func (r *SettingsRepo) Get(ctx context.Context, key string) (string, int64, error) {
-	var s schema.GatewaySetting
-	err := r.pool.QueryRow(ctx, `
-		SELECT key, value_json, updated_at FROM gateway_settings WHERE key = $1
-	`, key).Scan(&s.Key, &s.ValueJSON, &s.UpdatedAt)
+	var row schema.GatewaySetting
+	err := r.db.WithContext(ctx).
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		First(&row).Error
 	if err != nil {
 		if isNoRows(err) {
 			return "", 0, ErrNotFound
 		}
 		return "", 0, err
 	}
-	return s.ValueJSON, s.UpdatedAt, nil
+	return row.ValueJSON, row.UpdatedAt, nil
 }
 
-// Upsert stores valueJSON under key, creating or replacing the row (mirrors the
-// INSERT ... ON CONFLICT DO UPDATE in the original).
+// Upsert stores valueJSON under key, creating or replacing the row.
 func (r *SettingsRepo) Upsert(ctx context.Context, key, valueJSON string) (int64, error) {
 	now := nowMs()
-	_, err := r.pool.Exec(ctx, `
-		INSERT INTO gateway_settings (key, value_json, updated_at)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (key) DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = EXCLUDED.updated_at
-	`, key, valueJSON, now)
+	row := schema.GatewaySetting{Key: key, ValueJSON: valueJSON, UpdatedAt: now}
+	err := r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value_json", "updated_at"}),
+	}).Create(&row).Error
 	if err != nil {
 		return 0, err
 	}
@@ -50,8 +54,9 @@ func (r *SettingsRepo) Upsert(ctx context.Context, key, valueJSON string) (int64
 
 // Delete removes a settings key. No-op if absent.
 func (r *SettingsRepo) Delete(ctx context.Context, key string) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM gateway_settings WHERE key = $1`, key)
-	return err
+	return r.db.WithContext(ctx).
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		Delete(&schema.GatewaySetting{}).Error
 }
 
 // ErrSettingsNotFound is returned by Get when the key is absent. Aliased to

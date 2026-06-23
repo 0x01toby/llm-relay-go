@@ -22,12 +22,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
 
 	"github.com/taozhang/llmrelay/internal/configstore"
 	"github.com/taozhang/llmrelay/internal/consoleauth"
 	"github.com/taozhang/llmrelay/internal/consolestore"
 	"github.com/taozhang/llmrelay/internal/cors"
+	"github.com/taozhang/llmrelay/internal/db"
 	"github.com/taozhang/llmrelay/internal/repo"
 	"github.com/taozhang/llmrelay/internal/routing"
 	"github.com/taozhang/llmrelay/internal/schema"
@@ -35,27 +36,30 @@ import (
 
 // API holds all the dependencies the console routes need.
 type API struct {
-	password    string
-	pool        *pgxpool.Pool
-	store       *configstore.Store
-	provider    *repo.ProviderRepo
-	alias       *repo.AliasRepo
-	apikey      *repo.APIKeyRepo
-	settings    *repo.SettingsRepo
-	requests    *consolestore.Repository
+	password string
+	gdb      *gorm.DB
+	dialect  db.Dialect
+	store    *configstore.Store
+	provider *repo.ProviderRepo
+	alias    *repo.AliasRepo
+	apikey   *repo.APIKeyRepo
+	settings *repo.SettingsRepo
+	requests *consolestore.Repository
 }
 
-// New builds a console API handler.
-func New(pool *pgxpool.Pool, store *configstore.Store, password string, maxRecords int) *API {
+// New builds a console API handler. dialect is the detected backend, surfaced
+// in the stats response's storage_backend field.
+func New(gdb *gorm.DB, dialect db.Dialect, store *configstore.Store, password string, maxRecords int) *API {
 	return &API{
 		password: password,
-		pool:     pool,
+		gdb:      gdb,
+		dialect:  dialect,
 		store:    store,
-		provider: repo.NewProviderRepo(pool),
-		alias:    repo.NewAliasRepo(pool),
-		apikey:   repo.NewAPIKeyRepo(pool),
-		settings: repo.NewSettingsRepo(pool),
-		requests: consolestore.New(pool, maxRecords),
+		provider: repo.NewProviderRepo(gdb),
+		alias:    repo.NewAliasRepo(gdb),
+		apikey:   repo.NewAPIKeyRepo(gdb),
+		settings: repo.NewSettingsRepo(gdb),
+		requests: consolestore.New(gdb, maxRecords),
 	}
 }
 
@@ -701,135 +705,59 @@ func parseListFilter(r *http.Request) consolestore.ListFilter {
 // quiet unused-import guard for context (used in some handlers).
 var _ = context.Background
 
-// --- Stats & filters (minimal implementations for the dashboard) ---
+// --- Stats & filters ---
 
 // handleStats aggregates console_requests for the dashboard. Supports a `range`
 // query param (1h, 24h, 7d, 30d). Returns the shape expected by the React
-// dashboard's `useUsageStats` hook.
-//
-// Note: this is a simplified port of console-store.ts:buildUsageStats — it
-// omits per-model cost (no catalog lookup), failover chain analysis, and
-// per-cache-point details. A full port would replicate those aggregates.
+// dashboard's useUsageStats hook.
 func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	createdAfter := parseRangeMs(r.URL.Query().Get("range"))
 	ctx := r.Context()
 
-	// Overview.
-	var overview struct {
-		Total            int64
-		CacheHits        int64
-		CacheCreates     int64
-		CacheMisses      int64
-		Errors           int64
-		Failovers        int64
-		InputTokens      int64
-		OutputTokens     int64
-		TotalTokens      int64
-	}
-	overviewQuery := `
-		SELECT
-			COALESCE(SUM(input_tokens), 0),
-			COALESCE(SUM(output_tokens), 0),
-			COALESCE(SUM(cache_read_input_tokens), 0),
-			COALESCE(SUM(cache_creation_input_tokens), 0),
-			COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN failover_from IS NOT NULL AND failover_from != '' THEN 1 ELSE 0 END), 0),
-			COUNT(*)
-		FROM console_requests
-	`
-	args := []interface{}{}
-	if createdAfter > 0 {
-		overviewQuery += " WHERE created_at >= $1"
-		args = append(args, createdAfter)
-	}
-	var total, inputTok, outputTok, cacheRead, cacheCreate, errors, failovers int64
-	err := a.pool.QueryRow(ctx, overviewQuery, args...).Scan(
-		&inputTok, &outputTok, &cacheRead, &cacheCreate, &errors, &failovers, &total,
-	)
+	overview, err := computeOverview(ctx, a.gdb, createdAfter)
 	if err != nil {
 		log.Printf("[console] stats overview: %v", err)
 		writeJSON(w, http.StatusInternalServerError, obj{"error": "failed to compute stats"})
 		return
 	}
-	overview.Total = total
-	overview.InputTokens = inputTok
-	overview.OutputTokens = outputTok
-	overview.TotalTokens = inputTok + outputTok
-	overview.CacheHits = cacheRead
-	overview.CacheCreates = cacheCreate
-	overview.CacheMisses = total - cacheRead - cacheCreate
-	if overview.CacheMisses < 0 {
-		overview.CacheMisses = 0
-	}
-	overview.Errors = errors
-	overview.Failovers = failovers
 	hitRate := 0.0
-	if total > 0 {
-		hitRate = float64(cacheRead) / float64(total)
+	if overview.Total > 0 {
+		hitRate = float64(overview.CacheHits) / float64(overview.Total)
 	}
 
-	// Per-route and per-model buckets.
-	bucketQuery := func(groupCol string) string {
-		q := "SELECT " + groupCol + ", COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_input_tokens), 0), COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0) FROM console_requests"
-		if createdAfter > 0 {
-			q += " WHERE created_at >= $1"
-		}
-		q += " GROUP BY " + groupCol + " ORDER BY " + groupCol
-		return q
-	}
-	mkBuckets := func(q string) []obj {
-		rows, err := a.pool.Query(ctx, q, args...)
-		if err != nil {
-			return nil
-		}
-		defer rows.Close()
-		var out []obj
-		for rows.Next() {
-			var key string
-			var requests, inTok, outTok, cacheR, errs int64
-			if err := rows.Scan(&key, &requests, &inTok, &outTok, &cacheR, &errs); err != nil {
-				continue
-			}
-			out = append(out, obj{
-				"key": key, "label": key,
-				"requests": requests, "errors": errs,
-				"cache_hits": cacheR, "cache_creates": 0,
-				"total_input_tokens": inTok, "total_output_tokens": outTok,
-			})
-		}
-		return out
-	}
-	routeBuckets := mkBuckets(bucketQuery("route_prefix"))
-	modelBuckets := mkBuckets(bucketQuery("request_model"))
-	clientBuckets := mkBuckets(bucketQuery("api_key_name"))
+	routeBuckets, _ := computeBuckets(ctx, a.gdb, "route_prefix", createdAfter)
+	modelBuckets, _ := computeBuckets(ctx, a.gdb, "request_model", createdAfter)
+	clientBuckets, _ := computeBuckets(ctx, a.gdb, "api_key_name", createdAfter)
 
-	// Time-series: bucket by minute (1h), 5min (24h), hour (7d/30d).
-	ts := buildTimeseries(ctx, a.pool, createdAfter)
+	routeObj := bucketsToObj(routeBuckets)
+	modelObj := bucketsToObj(modelBuckets)
+	clientObj := bucketsToObj(clientBuckets)
+	ts := computeTimeseries(ctx, a.gdb, createdAfter)
 
 	writeJSON(w, http.StatusOK, obj{
 		"overview": obj{
-			"total":              overview.Total,
-			"cache_hits":         overview.CacheHits,
-			"cache_creates":      overview.CacheCreates,
-			"cache_misses":       overview.CacheMisses,
-			"errors":             overview.Errors,
-			"failovers":          overview.Failovers,
-			"hit_rate":           hitRate,
-			"total_input_tokens":  overview.InputTokens,
-			"total_output_tokens": overview.OutputTokens,
-			"total_tokens":       overview.TotalTokens,
-			"storage_backend":    "postgresql",
+			"total":                overview.Total,
+			"cache_hits":           overview.CacheHits,
+			"cache_creates":        overview.CacheCreates,
+			"cache_misses":         overview.CacheMisses,
+			"errors":               overview.Errors,
+			"failovers":            overview.Failovers,
+			"hit_rate":             hitRate,
+			"total_input_tokens":   overview.InputTokens,
+			"total_output_tokens":  overview.OutputTokens,
+			"total_tokens":         overview.TotalTokens,
+			"storage_backend":      a.dialect.String(),
 			"retention_max_records": 50000,
 		},
 		"stats": obj{
-			"routes":  routeBuckets,
-			"models":  modelBuckets,
-			"clients": clientBuckets,
+			"routes":  routeObj,
+			"models":  modelObj,
+			"clients": clientObj,
 		},
 		"filters": obj{
-			"routes":  extractKeys(routeBuckets, "key"),
-			"models":  extractKeys(modelBuckets, "key"),
-			"clients": extractKeys(clientBuckets, "key"),
+			"routes":  extractKeys(routeObj, "key"),
+			"models":  extractKeys(modelObj, "key"),
+			"clients": extractKeys(clientObj, "key"),
 		},
 		"timeseries": ts,
 	})
@@ -839,47 +767,24 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 // (routes, models, api_key_names). Lighter than /stats — no aggregation.
 func (a *API) handleFilters(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	q := func(col string) []string {
-		rows, err := a.pool.Query(ctx, "SELECT DISTINCT "+col+" FROM console_requests WHERE "+col+" IS NOT NULL AND "+col+" != '' ORDER BY "+col)
-		if err != nil {
-			return nil
-		}
-		defer rows.Close()
-		var out []string
-		for rows.Next() {
-			var s string
-			if err := rows.Scan(&s); err == nil && s != "" {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	clients := q("api_key_name")
-	// Replace null api_key_name with the conventional "__anonymous__" sentinel
+	clients := distinctColumn(ctx, a.gdb, "api_key_name")
+	// Replace empty api_key_name with the conventional "__anonymous__" sentinel
 	// the dashboard uses to represent unauthenticated traffic.
 	for i, c := range clients {
 		if c == "" {
 			clients[i] = "__anonymous__"
 		}
 	}
-	rows, _ := a.pool.Query(ctx, `
-		SELECT DISTINCT api_key_name FROM console_requests
-		WHERE api_key_name IS NOT NULL AND api_key_name != '' ORDER BY api_key_name
-	`)
-	clientLabels := []obj{}
-	if rows != nil {
-		defer rows.Close()
-		for rows.Next() {
-			var n string
-			if err := rows.Scan(&n); err == nil && n != "" {
-				clientLabels = append(clientLabels, obj{"value": n, "label": n})
-			}
+	clientLabels := make([]obj, 0, len(clients))
+	for _, n := range clients {
+		if n != "" {
+			clientLabels = append(clientLabels, obj{"value": n, "label": n})
 		}
 	}
 	writeJSON(w, http.StatusOK, obj{
 		"ok":      true,
-		"routes":  q("route_prefix"),
-		"models":  q("request_model"),
+		"routes":  distinctColumn(ctx, a.gdb, "route_prefix"),
+		"models":  distinctColumn(ctx, a.gdb, "request_model"),
 		"clients": clientLabels,
 	})
 }
@@ -904,75 +809,6 @@ func parseRangeMs(s string) int64 {
 		return now - int64(30*24*time.Hour/time.Millisecond)
 	}
 	return 0
-}
-
-// buildTimeseries buckets requests by time based on the active range. Mirror's
-// the original's bucket-size selection (1min/1h/1d) at a minimum level.
-func buildTimeseries(ctx context.Context, pool *pgxpool.Pool, createdAfter int64) []obj {
-	bucketSec := int64(3600) // default 1h
-	now := time.Now().UnixMilli()
-	switch {
-	case createdAfter > now-int64(time.Hour/time.Millisecond):
-		bucketSec = 60
-	case createdAfter > now-int64(7*24*time.Hour/time.Millisecond):
-		bucketSec = 300
-	}
-	// If createdAfter is 0 (all time), use a coarse 1-day bucket and limit rows.
-	if createdAfter == 0 {
-		createdAfter = now - 30*24*3600*1000 // last 30 days max
-		bucketSec = 86400
-	}
-	// Generate empty buckets so the dashboard always shows a contiguous series.
-	var points []obj
-	for t := alignDown(createdAfter, bucketSec*1000); t < now; t += bucketSec * 1000 {
-		points = append(points, obj{
-			"bucket_start": t,
-			"bucket_label": time.UnixMilli(t).Format("01-02 15:04"),
-			"requests":     0, "errors": 0, "total_tokens": 0, "total_cost": 0,
-		})
-	}
-	// Fill in actual data.
-	rows, err := pool.Query(ctx, `
-		SELECT
-		  (created_at / ($1 * 1000)) * ($1 * 1000) AS bucket_start,
-		  COUNT(*),
-		  COALESCE(SUM(input_tokens + output_tokens), 0),
-		  COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0)
-		FROM console_requests
-		WHERE created_at >= $2
-		GROUP BY bucket_start
-		ORDER BY bucket_start
-	`, bucketSec, createdAfter)
-	if err != nil {
-		return points
-	}
-	defer rows.Close()
-	// Index by bucket_start for fast updates.
-	index := map[int64]int{}
-	for i, p := range points {
-		if bs, ok := p["bucket_start"].(int64); ok {
-			index[bs] = i
-		}
-	}
-	for rows.Next() {
-		var bs int64
-		var requests, tokens, errs int64
-		if err := rows.Scan(&bs, &requests, &tokens, &errs); err != nil {
-			continue
-		}
-		bs = alignDown(bs, bucketSec*1000)
-		if i, ok := index[bs]; ok {
-			points[i]["requests"] = requests
-			points[i]["errors"] = errs
-			points[i]["total_tokens"] = tokens
-			points[i]["total_cost"] = 0 // catalog lookup not implemented
-		}
-	}
-	return points
-}
-
-func alignDown(ms int64, granularity int64) int64 {
-	return (ms / granularity) * granularity
 }
 
 func extractKeys(buckets []obj, key string) []string {
@@ -1209,8 +1045,8 @@ func (a *API) handleModels(w http.ResponseWriter, r *http.Request) {
 	models := resolver.Models()
 
 	// Load overrides and per-model pricing from DB.
-	overrides, _ := loadModelOverrides(r.Context(), a.pool)
-	pricing, _ := loadModelPricing(r.Context(), a.pool)
+	overrides, _ := loadModelOverrides(r.Context(), a.gdb)
+	pricing, _ := loadModelPricing(r.Context(), a.gdb)
 
 	out := obj{"openai": []obj{}, "anthropic": []obj{}}
 	for _, m := range models {
@@ -1227,7 +1063,7 @@ func (a *API) handleModels(w http.ResponseWriter, r *http.Request) {
 			entry["pricing"] = p
 		}
 		if ov, ok := overrides[key]; ok {
-			entry["override"] = ov
+			entry["override"] = overrideEntryToObj(ov)
 		}
 		// Models with channelName="virtual-route" are aliases — group by the
 		// model's resolved type from the alias target. The resolver already
@@ -1235,6 +1071,19 @@ func (a *API) handleModels(w http.ResponseWriter, r *http.Request) {
 		out[string(m.Type)] = append(out[string(m.Type)].([]obj), entry)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// overrideEntryToObj converts a modelOverrideEntry into the dashboard's override
+// object shape { context?, pricing?, updatedAt }.
+func overrideEntryToObj(e modelOverrideEntry) obj {
+	out := obj{"updatedAt": e.UpdatedAt}
+	if e.Context != nil {
+		out["context"] = *e.Context
+	}
+	if e.Pricing != nil {
+		out["pricing"] = e.Pricing
+	}
+	return out
 }
 
 // handleModelMetadata upserts a per-(channel, model) override. Used by the
@@ -1280,16 +1129,7 @@ func (a *API) handleModelMetadata(w http.ResponseWriter, r *http.Request) {
 		pricingJSON = &s
 	}
 	now := time.Now().UnixMilli()
-	// Upsert: if exists, update; else insert.
-	_, err = a.pool.Exec(r.Context(), `
-		INSERT INTO model_metadata_overrides (channel_name, model_id, context_window, pricing_json, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $5)
-		ON CONFLICT (channel_name, model_id) DO UPDATE SET
-		  context_window = EXCLUDED.context_window,
-		  pricing_json = EXCLUDED.pricing_json,
-		  updated_at = EXCLUDED.updated_at
-	`, channel, model, ctxWindow, pricingJSON, now)
-	if err != nil {
+	if err := upsertModelMetadata(r.Context(), a.gdb, channel, model, ctxWindow, pricingJSON); err != nil {
 		log.Printf("[console] upsert model metadata: %v", err)
 		writeJSON(w, http.StatusInternalServerError, obj{"error": "failed to save"})
 		return
@@ -1299,7 +1139,7 @@ func (a *API) handleModelMetadata(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, obj{
 		"id":          model,
 		"channelName": channel,
-		"type":        "openai", // The frontend uses a simpler GatewayModel — pick from DB.
+		"type":        "openai",
 		"context":     ctxWindow,
 		"pricing":     body.Pricing,
 		"override": obj{
@@ -1308,58 +1148,4 @@ func (a *API) handleModelMetadata(w http.ResponseWriter, r *http.Request) {
 			"updatedAt": now,
 		},
 	})
-}
-
-// loadModelOverrides returns a map keyed by "channelName:modelId" → override obj.
-func loadModelOverrides(ctx context.Context, pool *pgxpool.Pool) (map[string]obj, error) {
-	rows, err := pool.Query(ctx, `SELECT channel_name, model_id, context_window, pricing_json, updated_at FROM model_metadata_overrides`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]obj{}
-	for rows.Next() {
-		var ch, model string
-		var ctxWindow *int
-		var pricingJSON *string
-		var updatedAt int64
-		if err := rows.Scan(&ch, &model, &ctxWindow, &pricingJSON, &updatedAt); err != nil {
-			continue
-		}
-		entry := obj{"updatedAt": updatedAt}
-		if ctxWindow != nil {
-			entry["context"] = *ctxWindow
-		}
-		if pricingJSON != nil && *pricingJSON != "" {
-			var p map[string]interface{}
-			if err := json.Unmarshal([]byte(*pricingJSON), &p); err == nil {
-				entry["pricing"] = p
-			}
-		}
-		out[ch+":"+model] = entry
-	}
-	return out, nil
-}
-
-// loadModelPricing returns a map keyed by "channelName:modelId" → pricing obj.
-func loadModelPricing(ctx context.Context, pool *pgxpool.Pool) (map[string]obj, error) {
-	// Pricing is sourced from model_catalog_cache (one row per model).
-	rows, err := pool.Query(ctx, `SELECT model_id, pricing_json FROM model_catalog_cache WHERE pricing_json IS NOT NULL AND pricing_json != ''`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]obj{}
-	for rows.Next() {
-		var id, raw string
-		if err := rows.Scan(&id, &raw); err != nil {
-			continue
-		}
-		var p map[string]interface{}
-		if err := json.Unmarshal([]byte(raw), &p); err != nil {
-			continue
-		}
-		out[id] = p // keyed by model id only (no channel)
-	}
-	return out, nil
 }

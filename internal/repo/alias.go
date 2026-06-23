@@ -6,18 +6,18 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
 
 	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // AliasRepo owns the model_aliases table.
 type AliasRepo struct {
-	pool *pgxpool.Pool
+	db *gorm.DB
 }
 
-// NewAliasRepo builds an AliasRepo against pool.
-func NewAliasRepo(pool *pgxpool.Pool) *AliasRepo { return &AliasRepo{pool: pool} }
+// NewAliasRepo builds an AliasRepo against gdb.
+func NewAliasRepo(gdb *gorm.DB) *AliasRepo { return &AliasRepo{db: gdb} }
 
 // AliasTarget is a single alias routing target.
 type AliasTarget struct {
@@ -36,132 +36,112 @@ type AliasInput struct {
 	Enabled     *bool
 }
 
-// List returns all aliases ordered by created_at (mirrors listModelAliases).
+// List returns all aliases ordered by created_at.
 func (r *AliasRepo) List(ctx context.Context) ([]schema.ModelAlias, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, alias, provider, model, targets_json, description, visible, enabled, created_at, updated_at
-		FROM model_aliases
-		ORDER BY created_at ASC
-	`)
-	if err != nil {
+	var rows []schema.ModelAlias
+	if err := r.db.WithContext(ctx).Order("created_at ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []schema.ModelAlias
-	for rows.Next() {
-		var a schema.ModelAlias
-		if err := rows.Scan(&a.ID, &a.Alias, &a.Provider, &a.Model, &a.TargetsJSON, &a.Description, &a.Visible, &a.Enabled, &a.CreatedAt, &a.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, a)
-	}
-	return out, rows.Err()
+	return rows, nil
 }
 
 // Get returns one alias by id, or ErrNotFound.
 func (r *AliasRepo) Get(ctx context.Context, id int) (schema.ModelAlias, error) {
-	var a schema.ModelAlias
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, alias, provider, model, targets_json, description, visible, enabled, created_at, updated_at
-		FROM model_aliases WHERE id = $1
-	`, id).Scan(&a.ID, &a.Alias, &a.Provider, &a.Model, &a.TargetsJSON, &a.Description, &a.Visible, &a.Enabled, &a.CreatedAt, &a.UpdatedAt)
+	var row schema.ModelAlias
+	err := r.db.WithContext(ctx).First(&row, id).Error
 	if err != nil {
 		if isNoRows(err) {
 			return schema.ModelAlias{}, ErrNotFound
 		}
 		return schema.ModelAlias{}, err
 	}
-	return a, nil
+	return row, nil
 }
 
 // Create inserts a new alias and returns the created row.
 func (r *AliasRepo) Create(ctx context.Context, in AliasInput) (schema.ModelAlias, error) {
-	now := nowMs()
-	targetsJSON := targetsToJSON(in.Targets)
-	visible := 1
-	if in.Visible != nil && !*in.Visible {
-		visible = 0
-	}
-	enabled := 1
-	if in.Enabled != nil && !*in.Enabled {
-		enabled = 0
-	}
-	var a schema.ModelAlias
-	err := r.pool.QueryRow(ctx, `
-		INSERT INTO model_aliases (alias, provider, model, targets_json, description, visible, enabled, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		RETURNING id, alias, provider, model, targets_json, description, visible, enabled, created_at, updated_at
-	`, in.Alias, in.Provider, in.Model, targetsJSON, in.Description, visible, enabled, now, now).Scan(
-		&a.ID, &a.Alias, &a.Provider, &a.Model, &a.TargetsJSON, &a.Description, &a.Visible, &a.Enabled, &a.CreatedAt, &a.UpdatedAt)
-	if err != nil {
+	row := buildAliasRow(in, 0)
+	if err := r.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return schema.ModelAlias{}, err
 	}
-	return a, nil
+	return row, nil
 }
 
 // Update modifies an alias. Returns ErrNotFound if absent.
 func (r *AliasRepo) Update(ctx context.Context, id int, in AliasInput) (schema.ModelAlias, error) {
-	now := nowMs()
-	targetsJSON := targetsToJSON(in.Targets)
-	visible := 1
-	if in.Visible != nil && !*in.Visible {
-		visible = 0
+	row := buildAliasRow(in, id)
+	res := r.db.WithContext(ctx).Model(&schema.ModelAlias{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"alias":        row.Alias,
+		"provider":     row.Provider,
+		"model":        row.Model,
+		"targets_json": row.TargetsJSON,
+		"description":  row.Description,
+		"visible":      row.Visible,
+		"enabled":      row.Enabled,
+		"updated_at":   row.UpdatedAt,
+	})
+	if res.Error != nil {
+		return schema.ModelAlias{}, res.Error
 	}
-	enabled := 1
-	if in.Enabled != nil && !*in.Enabled {
-		enabled = 0
+	if res.RowsAffected == 0 {
+		return schema.ModelAlias{}, fmt.Errorf("alias %d %w", id, ErrNotFound)
 	}
-	var a schema.ModelAlias
-	err := r.pool.QueryRow(ctx, `
-		UPDATE model_aliases SET
-		  alias = $1, provider = $2, model = $3, targets_json = $4,
-		  description = $5, visible = $6, enabled = $7, updated_at = $8
-		WHERE id = $9
-		RETURNING id, alias, provider, model, targets_json, description, visible, enabled, created_at, updated_at
-	`, in.Alias, in.Provider, in.Model, targetsJSON, in.Description, visible, enabled, now, id).Scan(
-		&a.ID, &a.Alias, &a.Provider, &a.Model, &a.TargetsJSON, &a.Description, &a.Visible, &a.Enabled, &a.CreatedAt, &a.UpdatedAt)
-	if err != nil {
-		if isNoRows(err) {
-			return schema.ModelAlias{}, fmt.Errorf("alias %d %w", id, ErrNotFound)
-		}
-		return schema.ModelAlias{}, err
-	}
-	return a, nil
+	// Reload to get the full row (created_at etc).
+	return r.Get(ctx, id)
 }
 
 // SetEnabled toggles an alias's enabled flag.
 func (r *AliasRepo) SetEnabled(ctx context.Context, id int, enabled bool) (schema.ModelAlias, error) {
-	var a schema.ModelAlias
-	err := r.pool.QueryRow(ctx, `
-		UPDATE model_aliases SET enabled = $1, updated_at = $2
-		WHERE id = $3
-		RETURNING id, alias, provider, model, targets_json, description, visible, enabled, created_at, updated_at
-	`, boolToInt(enabled), nowMs(), id).Scan(
-		&a.ID, &a.Alias, &a.Provider, &a.Model, &a.TargetsJSON, &a.Description, &a.Visible, &a.Enabled, &a.CreatedAt, &a.UpdatedAt)
-	if err != nil {
-		if isNoRows(err) {
-			return schema.ModelAlias{}, fmt.Errorf("alias %d %w", id, ErrNotFound)
-		}
-		return schema.ModelAlias{}, err
+	res := r.db.WithContext(ctx).Model(&schema.ModelAlias{}).Where("id = ?", id).
+		Updates(map[string]interface{}{"enabled": boolToInt(enabled), "updated_at": nowMs()})
+	if res.Error != nil {
+		return schema.ModelAlias{}, res.Error
 	}
-	return a, nil
+	if res.RowsAffected == 0 {
+		return schema.ModelAlias{}, fmt.Errorf("alias %d %w", id, ErrNotFound)
+	}
+	return r.Get(ctx, id)
 }
 
 // Delete removes an alias. Returns ErrNotFound if absent.
 func (r *AliasRepo) Delete(ctx context.Context, id int) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM model_aliases WHERE id = $1`, id)
-	if err != nil {
-		return err
+	res := r.db.WithContext(ctx).Delete(&schema.ModelAlias{}, id)
+	if res.Error != nil {
+		return res.Error
 	}
-	if tag.RowsAffected() == 0 {
+	if res.RowsAffected == 0 {
 		return fmt.Errorf("alias %d %w", id, ErrNotFound)
 	}
 	return nil
 }
 
-// targetsToJSON serializes targets; empty slice → "[]" (never empty string,
-// so the DB column always holds valid JSON). Mirrors the original's
-// JSON.stringify(targets).
+// buildAliasRow assembles a ModelAlias from input. When id is 0, Create will
+// auto-generate it.
+func buildAliasRow(in AliasInput, id int) schema.ModelAlias {
+	visible := 1
+	if in.Visible != nil && !*in.Visible {
+		visible = 0
+	}
+	enabled := 1
+	if in.Enabled != nil && !*in.Enabled {
+		enabled = 0
+	}
+	return schema.ModelAlias{
+		ID:          id,
+		Alias:       in.Alias,
+		Provider:    in.Provider,
+		Model:       in.Model,
+		TargetsJSON: targetsToJSON(in.Targets),
+		Description: in.Description,
+		Visible:     visible,
+		Enabled:     enabled,
+		CreatedAt:   nowMs(),
+		UpdatedAt:   nowMs(),
+	}
+}
+
+// targetsToJSON serializes targets; empty slice → "" (the column may be empty,
+// callers fall back to the single {provider, model} pair via ParseTargets).
 func targetsToJSON(targets []AliasTarget) string {
 	if len(targets) == 0 {
 		return ""
@@ -174,15 +154,11 @@ func targetsToJSON(targets []AliasTarget) string {
 }
 
 // ParseTargets decodes an alias's targets_json, falling back to the single
-// {provider, model} pair when the column is empty (mirrors parseTargets).
+// {provider, model} pair when the column is empty.
 func ParseTargets(a schema.ModelAlias) ([]AliasTarget, error) {
-	raw := ""
 	if a.TargetsJSON != "" {
-		raw = a.TargetsJSON
-	}
-	if raw != "" {
 		var t []AliasTarget
-		if err := json.Unmarshal([]byte(raw), &t); err != nil {
+		if err := json.Unmarshal([]byte(a.TargetsJSON), &t); err != nil {
 			return nil, fmt.Errorf("invalid targets_json for alias %q: %w", a.Alias, err)
 		}
 		return t, nil

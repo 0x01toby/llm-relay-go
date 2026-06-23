@@ -1,28 +1,28 @@
-// Package repo implements the database access layer as hand-written pgx
-// repositories. Each repository owns one table and is constructed with a
-// shared *db.Pool. This replaces Drizzle ORM with direct SQL, keeping the
-// query semantics identical to the original src/*-store.ts modules.
+// Package repo implements the database access layer using GORM. Each
+// repository owns one table and is constructed with a shared *gorm.DB. This
+// works across Postgres, MySQL, and SQLite (GORM translates placeholders and
+// dialect-specific upsert syntax).
 package repo
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // ProviderRepo owns the console_providers table.
 type ProviderRepo struct {
-	pool *pgxpool.Pool
+	db *gorm.DB
 }
 
-// NewProviderRepo builds a ProviderRepo against pool.
-func NewProviderRepo(pool *pgxpool.Pool) *ProviderRepo { return &ProviderRepo{pool: pool} }
+// NewProviderRepo builds a ProviderRepo against gdb.
+func NewProviderRepo(gdb *gorm.DB) *ProviderRepo { return &ProviderRepo{db: gdb} }
 
 // ProviderInput is the mutation payload (mirrors ConfigEntry).
 type ProviderInput struct {
@@ -43,75 +43,50 @@ type ProviderInput struct {
 var ErrNotFound = errors.New("not found")
 
 // List returns all providers ordered by channel name, backfilling any rows
-// missing a provider_uuid (mirrors listConsoleProviderEntries).
+// missing a provider_uuid.
 func (r *ProviderRepo) List(ctx context.Context) ([]schema.ConsoleProvider, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT channel_name, provider_uuid, type, target_base_url, system_prompt,
-		       models_json, priority, auth_header, auth_value, extra_fields_json,
-		       routing_visibility, enabled, created_at, updated_at
-		FROM console_providers
-		ORDER BY channel_name ASC
-	`)
-	if err != nil {
+	var rows []schema.ConsoleProvider
+	if err := r.db.WithContext(ctx).Order("channel_name ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []schema.ConsoleProvider
+	// Backfill any rows missing a provider_uuid (mirrors the original).
 	var needBackfill []string
-	for rows.Next() {
-		var p schema.ConsoleProvider
-		if err := scanProvider(rows, &p); err != nil {
-			return nil, err
+	for i := range rows {
+		if rows[i].ProviderUUID == "" {
+			needBackfill = append(needBackfill, rows[i].ChannelName)
 		}
-		if p.ProviderUUID == "" {
-			needBackfill = append(needBackfill, p.ChannelName)
-		}
-		out = append(out, p)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
 	for _, name := range needBackfill {
-		if _, err := r.pool.Exec(ctx, `UPDATE console_providers SET provider_uuid = $1 WHERE channel_name = $2`, uuid.NewString(), name); err != nil {
+		if err := r.db.WithContext(ctx).Model(&schema.ConsoleProvider{}).
+			Where("channel_name = ?", name).
+			Update("provider_uuid", uuid.NewString()).Error; err != nil {
 			return nil, fmt.Errorf("backfill uuid for %s: %w", name, err)
 		}
 	}
 	if len(needBackfill) > 0 {
 		return r.List(ctx)
 	}
-	return out, nil
+	return rows, nil
 }
 
 // Create inserts a new provider. The provider_uuid is generated if empty.
 func (r *ProviderRepo) Create(ctx context.Context, channelName string, in ProviderInput) error {
-	now := nowMs()
 	pUUID := in.ProviderUUID
 	if pUUID == "" {
 		pUUID = uuid.NewString()
 	}
-	_, err := r.pool.Exec(ctx, `
-		INSERT INTO console_providers
-		  (channel_name, provider_uuid, type, target_base_url, system_prompt,
-		   models_json, priority, auth_header, auth_value, extra_fields_json,
-		   routing_visibility, enabled, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-	`,
-		channelName, pUUID, in.Type, in.TargetBaseURL, in.SystemPrompt,
-		modelsJSON(in.Models), in.Priority, in.AuthHeader, in.AuthValue, extraFieldsJSON(in.ExtraFields),
-		visibilityOrDefault(in.RoutingVisibility), boolToInt(in.Enabled), now, now,
-	)
-	return err
+	row := buildProviderRow(channelName, in, pUUID)
+	return r.db.WithContext(ctx).Create(&row).Error
 }
 
 // Upsert inserts or updates a provider on conflict, preserving the existing
-// provider_uuid if the row already exists (mirrors upsertConsoleProviderEntry).
+// provider_uuid if the row already exists.
 func (r *ProviderRepo) Upsert(ctx context.Context, channelName string, in ProviderInput) error {
-	now := nowMs()
 	// Preserve existing UUID if present.
 	var existingUUID string
-	err := r.pool.QueryRow(ctx, `SELECT provider_uuid FROM console_providers WHERE channel_name = $1`, channelName).Scan(&existingUUID)
+	err := r.db.WithContext(ctx).Model(&schema.ConsoleProvider{}).
+		Where("channel_name = ?", channelName).
+		Select("provider_uuid").Row().Scan(&existingUUID)
 	if err != nil && !isNoRows(err) {
 		return err
 	}
@@ -123,89 +98,79 @@ func (r *ProviderRepo) Upsert(ctx context.Context, channelName string, in Provid
 			pUUID = uuid.NewString()
 		}
 	}
-	_, err = r.pool.Exec(ctx, `
-		INSERT INTO console_providers
-		  (channel_name, provider_uuid, type, target_base_url, system_prompt,
-		   models_json, priority, auth_header, auth_value, extra_fields_json,
-		   routing_visibility, enabled, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-		ON CONFLICT (channel_name) DO UPDATE SET
-		  provider_uuid = EXCLUDED.provider_uuid,
-		  type = EXCLUDED.type,
-		  target_base_url = EXCLUDED.target_base_url,
-		  system_prompt = EXCLUDED.system_prompt,
-		  models_json = EXCLUDED.models_json,
-		  priority = EXCLUDED.priority,
-		  auth_header = EXCLUDED.auth_header,
-		  auth_value = EXCLUDED.auth_value,
-		  extra_fields_json = EXCLUDED.extra_fields_json,
-		  routing_visibility = EXCLUDED.routing_visibility,
-		  enabled = EXCLUDED.enabled,
-		  updated_at = EXCLUDED.updated_at
-	`,
-		channelName, pUUID, in.Type, in.TargetBaseURL, in.SystemPrompt,
-		modelsJSON(in.Models), in.Priority, in.AuthHeader, in.AuthValue, extraFieldsJSON(in.ExtraFields),
-		visibilityOrDefault(in.RoutingVisibility), boolToInt(in.Enabled), now, now,
-	)
-	return err
+	row := buildProviderRow(channelName, in, pUUID)
+	// ON CONFLICT (channel_name) DO UPDATE — GORM translates per dialect.
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "channel_name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"provider_uuid", "type", "target_base_url", "system_prompt", "models_json", "priority", "auth_header", "auth_value", "extra_fields_json", "routing_visibility", "enabled", "updated_at"}),
+	}).Create(&row).Error
 }
 
 // Update renames and/or updates a provider. Returns ErrNotFound if the row is
-// absent (mirrors updateConsoleProviderEntry).
+// absent.
 func (r *ProviderRepo) Update(ctx context.Context, currentName, nextName string, in ProviderInput) error {
-	now := nowMs()
-	var existingUUID string
-	err := r.pool.QueryRow(ctx, `SELECT provider_uuid FROM console_providers WHERE channel_name = $1`, currentName).Scan(&existingUUID)
+	var existing schema.ConsoleProvider
+	err := r.db.WithContext(ctx).Where("channel_name = ?", currentName).First(&existing).Error
 	if err != nil {
 		if isNoRows(err) {
 			return fmt.Errorf("Provider %q %w", currentName, ErrNotFound)
 		}
 		return err
 	}
+	existingUUID := existing.ProviderUUID
 	if existingUUID == "" {
 		existingUUID = uuid.NewString()
 	}
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE console_providers SET
-		  channel_name = $1, type = $2, target_base_url = $3, system_prompt = $4,
-		  models_json = $5, priority = $6, auth_header = $7, auth_value = $8,
-		  extra_fields_json = $9, routing_visibility = $10, provider_uuid = $11,
-		  enabled = $12, updated_at = $13
-		WHERE channel_name = $14
-	`,
-		nextName, in.Type, in.TargetBaseURL, in.SystemPrompt,
-		modelsJSON(in.Models), in.Priority, in.AuthHeader, in.AuthValue,
-		extraFieldsJSON(in.ExtraFields), visibilityOrDefault(in.RoutingVisibility),
-		existingUUID, boolToInt(in.Enabled), now, currentName,
-	)
-	if err != nil {
-		return err
+	row := buildProviderRow(nextName, in, existingUUID)
+	enabled := boolToInt(in.Enabled)
+	row.Enabled = enabled
+	res := r.db.WithContext(ctx).Model(&schema.ConsoleProvider{}).
+		Where("channel_name = ?", currentName).
+		Updates(map[string]interface{}{
+			"channel_name":       nextName,
+			"type":               row.Type,
+			"target_base_url":    row.TargetBaseURL,
+			"system_prompt":      row.SystemPrompt,
+			"models_json":        row.ModelsJSON,
+			"priority":           row.Priority,
+			"auth_header":        row.AuthHeader,
+			"auth_value":         row.AuthValue,
+			"extra_fields_json":  row.ExtraFieldsJSON,
+			"routing_visibility": row.RoutingVisibility,
+			"provider_uuid":      existingUUID,
+			"enabled":            enabled,
+			"updated_at":         row.UpdatedAt,
+		})
+	if res.Error != nil {
+		return res.Error
 	}
-	if tag.RowsAffected() == 0 {
+	if res.RowsAffected == 0 {
 		return fmt.Errorf("Provider %q %w", currentName, ErrNotFound)
 	}
 	return nil
 }
 
-// SetEnabled toggles a provider's enabled flag (mirrors toggleConsoleProviderEntry).
+// SetEnabled toggles a provider's enabled flag.
 func (r *ProviderRepo) SetEnabled(ctx context.Context, channelName string, enabled bool) error {
-	tag, err := r.pool.Exec(ctx, `UPDATE console_providers SET enabled = $1, updated_at = $2 WHERE channel_name = $3`, boolToInt(enabled), nowMs(), channelName)
-	if err != nil {
-		return err
+	res := r.db.WithContext(ctx).Model(&schema.ConsoleProvider{}).
+		Where("channel_name = ?", channelName).
+		Updates(map[string]interface{}{"enabled": boolToInt(enabled), "updated_at": nowMs()})
+	if res.Error != nil {
+		return res.Error
 	}
-	if tag.RowsAffected() == 0 {
+	if res.RowsAffected == 0 {
 		return fmt.Errorf("Provider %q %w", channelName, ErrNotFound)
 	}
 	return nil
 }
 
-// Delete removes a provider (mirrors deleteConsoleProviderEntry).
+// Delete removes a provider.
 func (r *ProviderRepo) Delete(ctx context.Context, channelName string) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM console_providers WHERE channel_name = $1`, channelName)
-	if err != nil {
-		return err
+	res := r.db.WithContext(ctx).Where("channel_name = ?", channelName).Delete(&schema.ConsoleProvider{})
+	if res.Error != nil {
+		return res.Error
 	}
-	if tag.RowsAffected() == 0 {
+	if res.RowsAffected == 0 {
 		return fmt.Errorf("Provider %q %w", channelName, ErrNotFound)
 	}
 	return nil
@@ -213,25 +178,47 @@ func (r *ProviderRepo) Delete(ctx context.Context, channelName string) error {
 
 // Clear removes all providers.
 func (r *ProviderRepo) Clear(ctx context.Context) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM console_providers`)
-	return err
+	return r.db.WithContext(ctx).Where("1 = 1").Delete(&schema.ConsoleProvider{}).Error
 }
 
-// --- helpers ---
+// GetByChannel returns the row for channelName, or ErrNotFound if absent.
+func (r *ProviderRepo) GetByChannel(ctx context.Context, channelName string) (schema.ConsoleProvider, error) {
+	var row schema.ConsoleProvider
+	err := r.db.WithContext(ctx).Where("channel_name = ?", channelName).First(&row).Error
+	if err != nil {
+		if isNoRows(err) {
+			return schema.ConsoleProvider{}, ErrNotFound
+		}
+		return schema.ConsoleProvider{}, err
+	}
+	return row, nil
+}
 
-func scanProvider(rows interface{ Scan(...interface{}) error }, p *schema.ConsoleProvider) error {
-	return rows.Scan(
-		&p.ChannelName, &p.ProviderUUID, &p.Type, &p.TargetBaseURL, &p.SystemPrompt,
-		&p.ModelsJSON, &p.Priority, &p.AuthHeader, &p.AuthValue, &p.ExtraFieldsJSON,
-		&p.RoutingVisibility, &p.Enabled, &p.CreatedAt, &p.UpdatedAt,
-	)
+// buildProviderRow assembles a ConsoleProvider from the input + channel/uuid.
+func buildProviderRow(channelName string, in ProviderInput, pUUID string) schema.ConsoleProvider {
+	return schema.ConsoleProvider{
+		ChannelName:       channelName,
+		ProviderUUID:      pUUID,
+		Type:              typeOrDefault(in.Type),
+		TargetBaseURL:     in.TargetBaseURL,
+		SystemPrompt:      in.SystemPrompt,
+		ModelsJSON:        modelsJSON(in.Models),
+		Priority:          in.Priority,
+		AuthHeader:        in.AuthHeader,
+		AuthValue:         in.AuthValue,
+		ExtraFieldsJSON:   extraFieldsJSON(in.ExtraFields),
+		RoutingVisibility: visibilityOrDefault(in.RoutingVisibility),
+		Enabled:           boolToInt(in.Enabled),
+		CreatedAt:         nowMs(),
+		UpdatedAt:         nowMs(),
+	}
 }
 
 func modelsJSON(models []map[string]interface{}) string {
 	if len(models) == 0 {
 		return "[]"
 	}
-	b, err := json.Marshal(models)
+	b, err := jsonMarshal(models)
 	if err != nil {
 		return "[]"
 	}
@@ -242,7 +229,7 @@ func extraFieldsJSON(fields map[string]interface{}) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	b, err := json.Marshal(fields)
+	b, err := jsonMarshal(fields)
 	if err != nil {
 		return ""
 	}
@@ -256,32 +243,16 @@ func visibilityOrDefault(v string) string {
 	return v
 }
 
+func typeOrDefault(t string) string {
+	if t == "" {
+		return "openai"
+	}
+	return t
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1
 	}
 	return 0
-}
-
-// GetByChannel returns the row for channelName, or ErrNotFound if absent.
-func (r *ProviderRepo) GetByChannel(ctx context.Context, channelName string) (schema.ConsoleProvider, error) {
-	var p schema.ConsoleProvider
-	err := r.pool.QueryRow(ctx, `
-		SELECT channel_name, provider_uuid, type, target_base_url, system_prompt,
-		       models_json, priority, auth_header, auth_value, extra_fields_json,
-		       routing_visibility, enabled, created_at, updated_at
-		FROM console_providers
-		WHERE channel_name = $1
-	`, channelName).Scan(
-		&p.ChannelName, &p.ProviderUUID, &p.Type, &p.TargetBaseURL, &p.SystemPrompt,
-		&p.ModelsJSON, &p.Priority, &p.AuthHeader, &p.AuthValue, &p.ExtraFieldsJSON,
-		&p.RoutingVisibility, &p.Enabled, &p.CreatedAt, &p.UpdatedAt,
-	)
-	if err != nil {
-		if isNoRows(err) {
-			return schema.ConsoleProvider{}, ErrNotFound
-		}
-		return schema.ConsoleProvider{}, err
-	}
-	return p, nil
 }

@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/taozhang/llmrelay/internal/configstore"
 	"github.com/taozhang/llmrelay/internal/consolestore"
 	"github.com/taozhang/llmrelay/internal/cors"
@@ -23,6 +21,7 @@ import (
 	"github.com/taozhang/llmrelay/internal/repo"
 	"github.com/taozhang/llmrelay/internal/responsesconv"
 	"github.com/taozhang/llmrelay/internal/routing"
+	"gorm.io/gorm"
 )
 
 // Handler is the gateway proxy engine. It is mounted as the catch-all route
@@ -33,7 +32,7 @@ import (
 // configstore). The per-request state lives in local variables, so a single
 // Handler is safe for concurrent use.
 type Handler struct {
-	pool         *pgxpool.Pool
+	gdb          *gorm.DB
 	store        *configstore.Store
 	keyRepo      *repo.APIKeyRepo
 	settingsRepo *repo.SettingsRepo
@@ -47,12 +46,12 @@ type Handler struct {
 
 // NewHandler builds a gateway Handler. requests and logtasks enable response
 // observation; pass nil to disable logging (e.g. in degraded mode).
-func NewHandler(pool *pgxpool.Pool, store *configstore.Store, adminKey string, cfgTimeouts TimeoutSettings, requests *consolestore.Repository, lt *logtasks.Coordinator) *Handler {
-	settingsRepo := repo.NewSettingsRepo(pool)
+func NewHandler(gdb *gorm.DB, store *configstore.Store, adminKey string, cfgTimeouts TimeoutSettings, requests *consolestore.Repository, lt *logtasks.Coordinator) *Handler {
+	settingsRepo := repo.NewSettingsRepo(gdb)
 	return &Handler{
-		pool:         pool,
+		gdb:          gdb,
 		store:        store,
-		keyRepo:      repo.NewAPIKeyRepo(pool),
+		keyRepo:      repo.NewAPIKeyRepo(gdb),
 		settingsRepo: settingsRepo,
 		adminKey:     adminKey,
 		timeouts:     newTimeoutCache(settingsRepo, cfgTimeouts),
