@@ -1,0 +1,35 @@
+# docker-compose for local development and self-contained deployment.
+# Brings up Postgres + the gateway together.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: lrs
+      POSTGRES_PASSWORD: lrs
+      POSTGRES_DB: lrs
+    ports:
+      - "5432:5432"
+    volumes:
+      - lrs-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lrs -d lrs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://lrs:lrs@postgres:5432/lrs?sslmode=disable
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-change-me}
+      PORT: "3300"
+    ports:
+      - "3300:3300"
+    # The gateway runs migrations on boot and degrades gracefully if PG isn't
+    # ready yet, but depends_on healthcheck avoids the race entirely.
+
+volumes:
+  lrs-pgdata:
