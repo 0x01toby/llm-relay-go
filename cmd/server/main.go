@@ -48,30 +48,31 @@ func main() {
 	// built even in degraded mode (the gateway will fail per-request if the DB
 	// is unreachable), but the health/db-reset endpoints let the operator
 	// recover without a restart.
-	poolHolder := db.NewPoolHolder(cfg.DatabaseURL, db.DefaultPoolConfig())
-	pool, err := poolHolder.Get(context.Background())
+	poolHolder := db.NewHolder(cfg.DatabaseURL, db.DefaultPoolConfig())
+	gdb, err := poolHolder.Get(context.Background())
 	if err != nil {
 		log.Printf("[DB] pool unavailable: %v (gateway will degrade)", err)
 	}
+	dialect, _ := db.DetectDialect(cfg.DatabaseURL)
 
 	var proxy http.Handler
 	var modelsHandler http.HandlerFunc
 	var consoleHandler http.Handler
 	var rootHandler http.HandlerFunc
 	lt := logtasks.New()
-	if pool != nil {
-		store := configstore.NewStoreForPool(pool)
-		reqRepo := consolestore.New(pool, cfg.DebugDBMaxRecords)
+	if gdb != nil {
+		store := configstore.NewStoreForDB(gdb)
+		reqRepo := consolestore.New(gdb, cfg.DebugDBMaxRecords)
 		gwTimeouts := gateway.TimeoutSettings{
 			DefaultFirstByteMs: cfg.Timeouts.DefaultFirstByteMs,
 			StreamFirstByteMs:  cfg.Timeouts.StreamFirstByteMs,
 			ImageFirstByteMs:   cfg.Timeouts.ImageFirstByteMs,
 			ResponseIdleMs:     cfg.Timeouts.ResponseIdleMs,
 		}
-		gw := gateway.NewHandler(pool, store, cfg.GatewayAPIKey, gwTimeouts, reqRepo, lt)
+		gw := gateway.NewHandler(gdb, store, cfg.GatewayAPIKey, gwTimeouts, reqRepo, lt)
 		proxy = gw
 		modelsHandler = gw.ModelListHandler("")
-		consoleHandler = consoleapi.New(pool, store, cfg.GatewayAPIKey, cfg.DebugDBMaxRecords).Routes()
+		consoleHandler = consoleapi.New(gdb, dialect, store, cfg.GatewayAPIKey, cfg.DebugDBMaxRecords).Routes()
 		// The root handler serves the SPA for browser navigation, but defers to
 		// the proxy for API/model paths (handled inside web.Handler).
 		webHandler := web.Handler()

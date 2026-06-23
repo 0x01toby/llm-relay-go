@@ -17,10 +17,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/singleflight"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/taozhang/llmrelay/internal/pricing"
+	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 const (
@@ -32,7 +34,7 @@ const (
 
 // Service owns the context/pricing caches and the models.dev fetcher.
 type Service struct {
-	pool       *pgxpool.Pool
+	db         *gorm.DB
 	httpClient *http.Client
 
 	mu             sync.RWMutex
@@ -44,48 +46,36 @@ type Service struct {
 }
 
 // New builds a catalog Service.
-func New(pool *pgxpool.Pool) *Service {
+func New(gdb *gorm.DB) *Service {
 	return &Service{
-		pool:       pool,
+		db:         gdb,
 		httpClient: &http.Client{Timeout: fetchTimeout},
 	}
 }
 
 // WarmFromDB loads the catalog from the model_catalog_cache table. Returns true
 // if the DB data is fresh (< 24h), so the caller can skip the network fetch.
-// Mirrors warmModelCatalogFromDb.
 func (s *Service) WarmFromDB(ctx context.Context) (bool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT model_id, context_window, pricing_json, fetched_at FROM model_catalog_cache`)
-	if err != nil {
+	var rows []schema.ModelCatalogCache
+	if err := s.db.WithContext(ctx).Find(&rows).Error; err != nil {
 		return false, err
 	}
-	defer rows.Close()
 
 	ctxCache := map[string]int{}
 	priceCache := map[string]*pricing.ModelPricing{}
 	var maxFetched int64
-	for rows.Next() {
-		var modelID string
-		var ctxWindow *int
-		var pricingJSON *string
-		var fetchedAt int64
-		if err := rows.Scan(&modelID, &ctxWindow, &pricingJSON, &fetchedAt); err != nil {
-			return false, err
+	for _, row := range rows {
+		if row.ContextWindow != nil {
+			ctxCache[row.ModelID] = *row.ContextWindow
 		}
-		if ctxWindow != nil {
-			ctxCache[modelID] = *ctxWindow
-		}
-		if pricingJSON != nil && *pricingJSON != "" {
-			if p := parsePricing(*pricingJSON); p != nil {
-				priceCache[modelID] = p
+		if row.PricingJSON != nil && *row.PricingJSON != "" {
+			if p := parsePricing(*row.PricingJSON); p != nil {
+				priceCache[row.ModelID] = p
 			}
 		}
-		if fetchedAt > maxFetched {
-			maxFetched = fetchedAt
+		if row.FetchedAt > maxFetched {
+			maxFetched = row.FetchedAt
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
 	}
 
 	s.mu.Lock()
@@ -219,41 +209,29 @@ func (s *Service) persistToDB(ctxCache map[string]int, priceCache map[string]*pr
 	}
 
 	now := time.Now().UnixMilli()
-	var batch [][]interface{}
-	models := make([]string, 0, len(ids))
 	for id := range ids {
-		models = append(models, id)
-	}
-
-	for i := 0; i < len(models); i += batchSize {
-		end := i + batchSize
-		if end > len(models) {
-			end = len(models)
+		ctxW := ctxCache[id]
+		var pricingStr *string
+		if p := priceCache[id]; p != nil {
+			b, _ := json.Marshal(p)
+			str := string(b)
+			pricingStr = &str
 		}
-		for _, id := range models[i:end] {
-			ctxW := ctxCache[id]
-			var pricingStr *string
-			if p := priceCache[id]; p != nil {
-				b, _ := json.Marshal(p)
-				s := string(b)
-				pricingStr = &s
-			}
-			var ctxPtr *int
-			if ctxW > 0 {
-				ctxPtr = &ctxW
-			}
-			_, err := s.pool.Exec(ctx, `
-				INSERT INTO model_catalog_cache (model_id, context_window, pricing_json, fetched_at)
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (model_id) DO UPDATE SET
-				  context_window = EXCLUDED.context_window,
-				  pricing_json = EXCLUDED.pricing_json,
-				  fetched_at = EXCLUDED.fetched_at
-			`, id, ctxPtr, pricingStr, now)
-			if err != nil {
-				log.Printf("[catalog] persist error for %s: %v", id, err)
-			}
-			batch = append(batch, nil)
+		var ctxPtr *int
+		if ctxW > 0 {
+			ctxPtr = &ctxW
+		}
+		row := schema.ModelCatalogCache{
+			ModelID:       id,
+			ContextWindow: ctxPtr,
+			PricingJSON:   pricingStr,
+			FetchedAt:     now,
+		}
+		if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "model_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"context_window", "pricing_json", "fetched_at"}),
+		}).Create(&row).Error; err != nil {
+			log.Printf("[catalog] persist error for %s: %v", id, err)
 		}
 	}
 }

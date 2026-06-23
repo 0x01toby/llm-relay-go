@@ -4,21 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
 
 	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // APIKeyRepo owns the console_api_keys table.
 type APIKeyRepo struct {
-	pool *pgxpool.Pool
+	db *gorm.DB
 }
 
-// NewAPIKeyRepo builds an APIKeyRepo against pool.
-func NewAPIKeyRepo(pool *pgxpool.Pool) *APIKeyRepo { return &APIKeyRepo{pool: pool} }
+// NewAPIKeyRepo builds an APIKeyRepo against gdb.
+func NewAPIKeyRepo(gdb *gorm.DB) *APIKeyRepo { return &APIKeyRepo{db: gdb} }
 
 // CreatedAPIKey is the result of Create: the raw key (shown once) plus the row.
 type CreatedAPIKey struct {
@@ -26,32 +25,17 @@ type CreatedAPIKey struct {
 	Row    schema.ConsoleAPIKey
 }
 
-// List returns all non-revoked keys, newest first (mirrors listManagedApiKeys).
+// List returns all non-revoked keys, newest first.
 func (r *APIKeyRepo) List(ctx context.Context) ([]schema.ConsoleAPIKey, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, name, key_hash, key_value, prefix, created_at, last_used_at,
-		       revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-		FROM console_api_keys
-		WHERE revoked = 0
-		ORDER BY created_at DESC
-	`)
-	if err != nil {
+	var rows []schema.ConsoleAPIKey
+	if err := r.db.WithContext(ctx).Where("revoked = 0").Order("created_at DESC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []schema.ConsoleAPIKey
-	for rows.Next() {
-		var k schema.ConsoleAPIKey
-		if err := scanAPIKey(rows, &k); err != nil {
-			return nil, err
-		}
-		out = append(out, k)
-	}
-	return out, rows.Err()
+	return rows, nil
 }
 
-// Create inserts a new key and returns the raw key + row (mirrors
-// createManagedApiKey). costQuotaMicrousd is nil for unlimited.
+// Create inserts a new key and returns the raw key + row. costQuotaMicrousd is
+// nil for unlimited.
 func (r *APIKeyRepo) Create(ctx context.Context, name string, costQuotaMicrousd *int64) (CreatedAPIKey, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -66,18 +50,23 @@ func (r *APIKeyRepo) Create(ctx context.Context, name string, costQuotaMicrousd 
 		return CreatedAPIKey{}, err
 	}
 	now := nowMs()
-	var k schema.ConsoleAPIKey
-	err = r.pool.QueryRow(ctx, `
-		INSERT INTO console_api_keys
-		  (id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-		RETURNING id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-	`, id, name, hashKey(rawKey), rawKey, keyPrefix(rawKey), now, nil, 0, "[]", costQuotaMicrousd, 0).Scan(
-		&k.ID, &k.Name, &k.KeyHash, &k.KeyValue, &k.Prefix, &k.CreatedAt, &k.LastUsedAt, &k.Revoked, &k.AllowedModelsJSON, &k.CostQuotaMicrousd, &k.CostUsedMicrousd)
-	if err != nil {
+	row := schema.ConsoleAPIKey{
+		ID:                id,
+		Name:              name,
+		KeyHash:           hashKey(rawKey),
+		KeyValue:          rawKey,
+		Prefix:            keyPrefix(rawKey),
+		CreatedAt:         now,
+		LastUsedAt:        nil,
+		Revoked:           0,
+		AllowedModelsJSON: "[]",
+		CostQuotaMicrousd: costQuotaMicrousd,
+		CostUsedMicrousd:  0,
+	}
+	if err := r.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return CreatedAPIKey{}, err
 	}
-	return CreatedAPIKey{RawKey: rawKey, Row: k}, nil
+	return CreatedAPIKey{RawKey: rawKey, Row: row}, nil
 }
 
 // Get returns one non-revoked key by id, or ErrNotFound.
@@ -86,54 +75,45 @@ func (r *APIKeyRepo) Get(ctx context.Context, id string) (schema.ConsoleAPIKey, 
 	if id == "" {
 		return schema.ConsoleAPIKey{}, ErrNotFound
 	}
-	var k schema.ConsoleAPIKey
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-		FROM console_api_keys
-		WHERE id = $1 AND revoked = 0
-	`, id).Scan(scanAPIKeyDests(&k)...)
+	var row schema.ConsoleAPIKey
+	err := r.db.WithContext(ctx).Where("id = ? AND revoked = 0", id).First(&row).Error
 	if err != nil {
 		if isNoRows(err) {
 			return schema.ConsoleAPIKey{}, ErrNotFound
 		}
 		return schema.ConsoleAPIKey{}, err
 	}
-	return k, nil
+	return row, nil
 }
 
-// Rename updates a key's name (mirrors renameManagedApiKey).
+// Rename updates a key's name.
 func (r *APIKeyRepo) Rename(ctx context.Context, id, name string) (schema.ConsoleAPIKey, error) {
 	id = strings.TrimSpace(id)
 	name = strings.TrimSpace(name)
 	if id == "" || name == "" {
 		return schema.ConsoleAPIKey{}, ErrNotFound
 	}
-	var k schema.ConsoleAPIKey
-	err := r.pool.QueryRow(ctx, `
-		UPDATE console_api_keys SET name = $1
-		WHERE id = $2 AND revoked = 0
-		RETURNING id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-	`, name, id).Scan(scanAPIKeyDests(&k)...)
-	if err != nil {
-		if isNoRows(err) {
-			return schema.ConsoleAPIKey{}, ErrNotFound
-		}
-		return schema.ConsoleAPIKey{}, err
+	res := r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).Where("id = ? AND revoked = 0", id).Update("name", name)
+	if res.Error != nil {
+		return schema.ConsoleAPIKey{}, res.Error
 	}
-	return k, nil
+	if res.RowsAffected == 0 {
+		return schema.ConsoleAPIKey{}, ErrNotFound
+	}
+	return r.Get(ctx, id)
 }
 
-// Delete hard-deletes a key (mirrors deleteManagedApiKey).
+// Delete hard-deletes a key.
 func (r *APIKeyRepo) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
 	}
-	tag, err := r.pool.Exec(ctx, `DELETE FROM console_api_keys WHERE id = $1`, id)
-	if err != nil {
-		return err
+	res := r.db.WithContext(ctx).Where("id = ?", id).Delete(&schema.ConsoleAPIKey{})
+	if res.Error != nil {
+		return res.Error
 	}
-	if tag.RowsAffected() == 0 {
+	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -141,36 +121,30 @@ func (r *APIKeyRepo) Delete(ctx context.Context, id string) error {
 
 // Clear removes all keys.
 func (r *APIKeyRepo) Clear(ctx context.Context) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM console_api_keys`)
-	return err
+	return r.db.WithContext(ctx).Where("1 = 1").Delete(&schema.ConsoleAPIKey{}).Error
 }
 
 // Authenticate looks up a key by hash (non-revoked), best-effort updates
-// last_used_at, and returns the row. Returns ErrNotFound on miss or DB error
-// (errors are swallowed to avoid leaking internals — mirrors the try/catch in
-// authenticateManagedApiKey).
+// last_used_at, and returns the row. Returns false on miss or DB error.
 func (r *APIKeyRepo) Authenticate(ctx context.Context, rawKey string) (schema.ConsoleAPIKey, bool) {
 	rawKey = strings.TrimSpace(rawKey)
 	if rawKey == "" {
 		return schema.ConsoleAPIKey{}, false
 	}
-	var k schema.ConsoleAPIKey
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-		FROM console_api_keys
-		WHERE key_hash = $1 AND revoked = 0
-		LIMIT 1
-	`, hashKey(rawKey)).Scan(scanAPIKeyDests(&k)...)
+	var row schema.ConsoleAPIKey
+	err := r.db.WithContext(ctx).Where("key_hash = ? AND revoked = 0", hashKey(rawKey)).First(&row).Error
 	if err != nil {
 		return schema.ConsoleAPIKey{}, false
 	}
-	// Best-effort last_used_at update; ignore errors.
-	_, _ = r.pool.Exec(ctx, `UPDATE console_api_keys SET last_used_at = $1 WHERE id = $2 AND revoked <> 1`, nowMs(), k.ID)
-	return k, true
+	// Best-effort last_used_at update.
+	_ = r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).
+		Where("id = ? AND revoked <> 1", row.ID).
+		Update("last_used_at", nowMs()).Error
+	return row, true
 }
 
-// SetAllowedModels replaces a key's model allowlist (mirrors
-// setApiKeyAllowedModels). Models are trimmed, de-duplicated, non-empty.
+// SetAllowedModels replaces a key's model allowlist. Models are trimmed,
+// de-duplicated, non-empty.
 func (r *APIKeyRepo) SetAllowedModels(ctx context.Context, id string, models []string) (schema.ConsoleAPIKey, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -181,19 +155,14 @@ func (r *APIKeyRepo) SetAllowedModels(ctx context.Context, id string, models []s
 	if err != nil {
 		return schema.ConsoleAPIKey{}, err
 	}
-	var k schema.ConsoleAPIKey
-	err = r.pool.QueryRow(ctx, `
-		UPDATE console_api_keys SET allowed_models_json = $1
-		WHERE id = $2 AND revoked = 0
-		RETURNING id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-	`, string(b), id).Scan(scanAPIKeyDests(&k)...)
-	if err != nil {
-		if isNoRows(err) {
-			return schema.ConsoleAPIKey{}, ErrNotFound
-		}
-		return schema.ConsoleAPIKey{}, err
+	res := r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).Where("id = ? AND revoked = 0", id).Update("allowed_models_json", string(b))
+	if res.Error != nil {
+		return schema.ConsoleAPIKey{}, res.Error
 	}
-	return k, nil
+	if res.RowsAffected == 0 {
+		return schema.ConsoleAPIKey{}, ErrNotFound
+	}
+	return r.Get(ctx, id)
 }
 
 // SetCostQuota sets a key's cost quota (nil = unlimited).
@@ -202,34 +171,14 @@ func (r *APIKeyRepo) SetCostQuota(ctx context.Context, id string, costQuotaMicro
 	if id == "" {
 		return schema.ConsoleAPIKey{}, ErrNotFound
 	}
-	var k schema.ConsoleAPIKey
-	err := r.pool.QueryRow(ctx, `
-		UPDATE console_api_keys SET cost_quota_microusd = $1
-		WHERE id = $2 AND revoked = 0
-		RETURNING id, name, key_hash, key_value, prefix, created_at, last_used_at, revoked, allowed_models_json, cost_quota_microusd, cost_used_microusd
-	`, costQuotaMicrousd, id).Scan(scanAPIKeyDests(&k)...)
-	if err != nil {
-		if isNoRows(err) {
-			return schema.ConsoleAPIKey{}, ErrNotFound
-		}
-		return schema.ConsoleAPIKey{}, err
+	res := r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).Where("id = ? AND revoked = 0", id).Update("cost_quota_microusd", costQuotaMicrousd)
+	if res.Error != nil {
+		return schema.ConsoleAPIKey{}, res.Error
 	}
-	return k, nil
-}
-
-// --- helpers ---
-
-func scanAPIKey(rows interface{ Scan(...interface{}) error }, k *schema.ConsoleAPIKey) error {
-	return rows.Scan(scanAPIKeyDests(k)...)
-}
-
-// scanAPIKeyDests returns the destination slice in column order, so both Query
-// and QueryRow paths share the exact same scan layout.
-func scanAPIKeyDests(k *schema.ConsoleAPIKey) []interface{} {
-	return []interface{}{
-		&k.ID, &k.Name, &k.KeyHash, &k.KeyValue, &k.Prefix, &k.CreatedAt, &k.LastUsedAt,
-		&k.Revoked, &k.AllowedModelsJSON, &k.CostQuotaMicrousd, &k.CostUsedMicrousd,
+	if res.RowsAffected == 0 {
+		return schema.ConsoleAPIKey{}, ErrNotFound
 	}
+	return r.Get(ctx, id)
 }
 
 // dedupeTrim trims, drops empties, and de-duplicates while preserving order.
@@ -250,8 +199,8 @@ func dedupeTrim(models []string) []string {
 	return out
 }
 
-// ParseAllowedModels decodes allowed_models_json defensively (mirrors
-// parseAllowedModels): non-strings dropped, trimmed, de-duped.
+// ParseAllowedModels decodes allowed_models_json defensively: non-strings
+// dropped, trimmed, de-duped.
 func ParseAllowedModels(jsonStr string) []string {
 	var raw []interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
@@ -270,8 +219,7 @@ func ParseAllowedModels(jsonStr string) []string {
 }
 
 // IsModelAllowed reports whether model matches any pattern. Patterns support a
-// trailing "*" suffix wildcard (mirrors isModelAllowed). Empty patterns = allow
-// all.
+// trailing "*" suffix wildcard. Empty patterns = allow all.
 func IsModelAllowed(model string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return true
@@ -295,13 +243,12 @@ func USDToQuotaMicroUSD(usd float64) int64 {
 	return int64(usd*MicroUSDPerUSD + 0.5)
 }
 
-// USDCostToChargeMicroUSD converts a cost to a charge in micro-USD, rounding up
-// (favors the gateway — mirrors usdCostToChargeMicrousd's Math.ceil).
+// USDCostToChargeMicroUSD converts a cost to a charge in micro-USD, rounding up.
 func USDCostToChargeMicroUSD(cost float64) int64 {
 	return int64(cost*MicroUSDPerUSD + 0.9999999)
 }
 
-// QuotaSnapshot is the derived quota view (mirrors buildApiKeyQuotaSnapshot).
+// QuotaSnapshot is the derived quota view.
 type QuotaSnapshot struct {
 	CostQuota      *float64
 	CostUsed       float64
@@ -324,6 +271,3 @@ func BuildQuotaSnapshot(quotaMicrousd *int64, usedMicrousd int64) QuotaSnapshot 
 	}
 	return snap
 }
-
-// fmt-safe guard to keep the import in case future logging is added.
-var _ = fmt.Sprintf

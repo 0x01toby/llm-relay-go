@@ -1,35 +1,26 @@
-// Package migrate runs database schema migrations at boot. It is a port of
-// src/db/migrate.ts:
+// Package migrate runs database schema setup at boot via GORM AutoMigrate.
 //
-//   - embeds the migration SQL files (no external filesystem dependency)
-//   - waits for Postgres to accept connections (exponential backoff)
-//   - acquires a pg_advisory_lock so concurrent replicas don't race
-//   - applies migrations via golang-migrate
-//   - returns a Status (success/skipped/failed) the caller reports via /health
+// Unlike the previous golang-migrate version, there are no versioned SQL files:
+// GORM inspects the models in internal/schema and creates tables/indexes
+// additively (never drops). This is dialect-agnostic and works across Postgres,
+// MySQL, and SQLite.
 //
-// The migration files were converted from the original Drizzle format: the
-// "--> statement-breakpoint" markers were stripped and the files renamed to
-// golang-migrate's NNNNNN_name.up.sql convention (down migrations are not
-// provided — the schema is append-only and reset is handled by the
-// /api/db/reset endpoint, which drops and re-applies).
+// It returns a Status (success/skipped/failed) the caller reports via /health,
+// and ResetDB drops all application tables for the degraded-mode recovery
+// endpoint.
 package migrate
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log"
-	"strings"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5" // pgx driver for migrate
-	"github.com/golang-migrate/migrate/v4/source/iofs"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
-	"github.com/taozhang/llmrelay/migrations"
+	"github.com/taozhang/llmrelay/internal/db"
+	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // Status mirrors the TS MigrationStatus union.
@@ -46,19 +37,13 @@ const (
 	StateFailed  = "failed"
 )
 
-// Advisory-lock constants match the original (namespace 20817, key 1).
-const (
-	LockNamespace = 20817
-	LockKey       = 1
-)
-
 // Retry tuning for waitForDbReady.
 const (
-	readyMaxRetries    = 30
+	readyMaxRetries     = 30
 	readyTestMaxRetries = 2
-	readyInitialDelay  = 500 * time.Millisecond
-	readyMaxDelay      = 5 * time.Second
-	probeConnectSecs   = 5
+	readyInitialDelay   = 500 * time.Millisecond
+	readyMaxDelay       = 5 * time.Second
+	readyConnectSecs    = 5
 )
 
 // Runner applies migrations. Create one with NewRunner and call Run.
@@ -68,13 +53,14 @@ type Runner struct {
 }
 
 // NewRunner builds a Runner for databaseURL. If isTestDB is true, Run returns
-// skipped immediately (matching the original's test-database bypass).
+// skipped immediately (matching the original's test-database bypass — though
+// with AutoMigrate this is mostly a no-op anyway).
 func NewRunner(databaseURL string, isTestDB bool) *Runner {
 	return &Runner{databaseURL: databaseURL, isTestDB: isTestDB}
 }
 
-// Run waits for the database, takes the advisory lock, and applies migrations.
-// It never panics: any failure becomes a Status{State: failed}.
+// Run waits for the database and applies AutoMigrate. It never panics: any
+// failure becomes a Status{State: failed}.
 func (r *Runner) Run(ctx context.Context) Status {
 	if r.isTestDB {
 		return Status{State: StateSkipped, Reason: "Test database detected"}
@@ -84,87 +70,24 @@ func (r *Runner) Run(ctx context.Context) Status {
 		return Status{State: StateFailed, Err: fmt.Sprintf("database not ready: %v", err)}
 	}
 
-	// Use a single-connection pool for the advisory lock + migrate so the lock
-	// is held on the same connection that runs the migrations.
-	pcfg, err := pgxpool.ParseConfig(r.databaseURL)
+	gdb, err := db.Open(ctx, r.databaseURL, db.DefaultPoolConfig())
 	if err != nil {
-		return Status{State: StateFailed, Err: fmt.Sprintf("parse url: %v", err)}
+		return Status{State: StateFailed, Err: fmt.Sprintf("open db: %v", err)}
 	}
-	pcfg.MaxConns = 1
-	pcfg.MinConns = 1
-	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
-	if err != nil {
-		return Status{State: StateFailed, Err: fmt.Sprintf("create pool: %v", err)}
-	}
-	defer pool.Close()
-
-	// Acquire the advisory lock on a dedicated connection we keep for the whole
-	// migration. pg_advisory_lock is session-scoped, so the connection must
-	// live until we unlock.
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return Status{State: StateFailed, Err: fmt.Sprintf("acquire connection: %v", err)}
-	}
-	defer conn.Release()
-
-	if _, err := conn.Exec(ctx, fmt.Sprintf("SELECT pg_advisory_lock(%d, %d)", LockNamespace, LockKey)); err != nil {
-		return Status{State: StateFailed, Err: fmt.Sprintf("advisory lock: %v", err)}
-	}
-	defer func() {
-		if _, err := conn.Exec(ctx, fmt.Sprintf("SELECT pg_advisory_unlock(%d, %d)", LockNamespace, LockKey)); err != nil {
-			log.Printf("[DB] advisory unlock error: %v", err)
-		}
-	}()
+	sqlDB, _ := gdb.DB()
+	defer sqlDB.Close()
 
 	log.Printf("[DB] Running migrations...")
-	if err := applyMigrations(r.databaseURL); err != nil {
+	if err := gdb.AutoMigrate(schema.AllModels()...); err != nil {
 		log.Printf("[DB] Migration failed: %v", err)
-		// Migrate's "no change" is not an error, but a dirty state is. Distinguish.
-		if errors.Is(err, migrate.ErrNoChange) {
-			log.Printf("[DB] Migrations: no change (already up to date)")
-			return Status{State: StateSuccess}
-		}
 		return Status{State: StateFailed, Err: err.Error()}
 	}
 	log.Printf("[DB] Migrations complete.")
 	return Status{State: StateSuccess}
 }
 
-// applyMigrations runs golang-migrate against databaseURL using the embedded
-// SQL files. The migrate library opens its own connection (the URL must
-// include the pgx/v5 scheme it expects).
-func applyMigrations(databaseURL string) error {
-	src, err := iofs.New(migrations.FS, ".")
-	if err != nil {
-		return fmt.Errorf("embed source: %w", err)
-	}
-	m, err := migrate.NewWithSourceInstance("iofs", src, databaseURLForMigrate(databaseURL))
-	if err != nil {
-		return fmt.Errorf("init migrate: %w", err)
-	}
-	defer m.Close()
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return err
-	}
-	return nil
-}
-
-// databaseURLForMigrate coerces a standard postgres:// or postgresql:// URL
-// into the form golang-migrate's pgx/v5 driver expects. The driver registers
-// under the "pgx5" scheme.
-func databaseURLForMigrate(databaseURL string) string {
-	u := databaseURL
-	switch {
-	case strings.HasPrefix(u, "postgres://"):
-		return "pgx5://" + strings.TrimPrefix(u, "postgres://")
-	case strings.HasPrefix(u, "postgresql://"):
-		return "pgx5://" + strings.TrimPrefix(u, "postgresql://")
-	}
-	return u
-}
-
-// waitForDbReady retries connecting until Postgres accepts connections or the
-// retry budget is exhausted. Exponential backoff (500ms → 5s cap). isTest
+// waitForDbReady retries connecting until the database accepts connections or
+// the retry budget is exhausted. Exponential backoff (500ms → 5s cap). isTest
 // shortens the budget to 2 attempts.
 func waitForDbReady(ctx context.Context, databaseURL string, isTest bool) error {
 	max := readyMaxRetries
@@ -196,34 +119,24 @@ func waitForDbReady(ctx context.Context, databaseURL string, isTest bool) error 
 	return lastErr
 }
 
-// probe opens a short-lived connection and runs SELECT 1.
+// probe opens a short-lived connection and confirms it's usable.
 func probe(ctx context.Context, databaseURL string) error {
-	pcfg, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		return err
-	}
-	pcfg.MaxConns = 1
-	pcfg.MinConns = 0
-	pcfg.MaxConnIdleTime = probeConnectSecs * time.Second
-
-	probeCtx, cancel := context.WithTimeout(ctx, probeConnectSecs*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, readyConnectSecs*time.Second)
 	defer cancel()
-
-	// Use a raw connect so we don't hold pool resources.
-	conn, err := pgx.Connect(probeCtx, databaseURL)
+	gdb, err := gorm.Open(db.OpenGormDialector(probeCtx, databaseURL), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
 		return err
 	}
-	defer conn.Close(probeCtx)
-	var one int
-	if err := conn.QueryRow(probeCtx, "SELECT 1").Scan(&one); err != nil {
+	sqlDB, err := gdb.DB()
+	if err != nil {
 		return err
 	}
-	return nil
+	defer sqlDB.Close()
+	return sqlDB.PingContext(probeCtx)
 }
 
-// isRetryableDbError mirrors the TS heuristic: PG starting-up code 57P03 and
-// common connection-refused/reset messages are retried.
+// isRetryableDbError mirrors the TS heuristic: connection-refused/reset and
+// starting-up messages are retried.
 func isRetryableDbError(err error) bool {
 	if err == nil {
 		return false
@@ -233,69 +146,83 @@ func isRetryableDbError(err error) bool {
 		"ECONNREFUSED", "ECONNRESET", "connection terminated",
 		"the database system is starting up",
 		"the database system is shutting down",
-		"57P03", // cannot connect now
+		"57P03", // PG cannot connect now
+		"server has gone away",
+		"connection refused",
 	}
 	for _, s := range retryable {
-		if strings.Contains(msg, s) {
+		if contains(msg, s) {
 			return true
 		}
 	}
 	return false
 }
 
-// ResetDB drops all user tables and the migrate bookkeeping, then re-applies
-// migrations. Mirrors resetDatabase in src/server.ts. Used by the degraded-mode
-// /api/db/reset endpoint.
+func contains(s, sub string) bool {
+	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+// ResetDB drops all application tables, then re-applies AutoMigrate. Used by
+// the degraded-mode /api/db/reset endpoint. Cross-dialect: uses GORM's
+// migrator to enumerate tables, then raw `DROP TABLE IF EXISTS` (portable and
+// tolerant of a table that doesn't exist yet, which the migrator's DropTable is
+// not on some drivers).
 func ResetDB(ctx context.Context, databaseURL string) error {
-	conn, err := pgx.Connect(ctx, databaseURL)
+	gdb, err := db.Open(ctx, databaseURL, db.DefaultPoolConfig())
 	if err != nil {
 		return err
 	}
-	defer conn.Close(ctx)
+	sqlDB, _ := gdb.DB()
+	defer sqlDB.Close()
 
-	// Drop all user tables in the public schema.
-	rows, err := conn.Query(ctx, `
-		SELECT tablename FROM pg_tables
-		WHERE schemaname = 'public'
-		AND tablename NOT LIKE 'pg_%'
-		AND tablename NOT LIKE 'sql_%'
-	`)
-	if err != nil {
-		return err
-	}
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return err
+	m := gdb.Migrator()
+	_ = m
+	quote := identQuote(gdb)
+	for _, model := range schema.AllModels() {
+		tableName := schemaTableName(gdb, model)
+		// DROP TABLE IF EXISTS is portable across all three dialects and never
+		// errors on a missing table — so we skip the HasTable probe (the
+		// glebarez sqlite migrator errors on HasTable for a fresh in-memory DB).
+		if err := gdb.WithContext(ctx).Exec("DROP TABLE IF EXISTS " + quote + tableName + quote).Error; err != nil {
+			log.Printf("[DB] drop table %s: %v", tableName, err)
 		}
-		tables = append(tables, name)
 	}
-	rows.Close()
-
-	for _, t := range tables {
-		if _, err := conn.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS "%s" CASCADE`, t)); err != nil {
-			return err
-		}
-		log.Printf("[DB] Dropped table: %s", t)
+	if err := gdb.WithContext(ctx).Exec("DROP TABLE IF EXISTS " + quote + "schema_migrations" + quote).Error; err != nil {
+		log.Printf("[DB] drop schema_migrations: %v", err)
 	}
 
-	// Drop the migrate bookkeeping schema (golang-migrate uses a "schema_migrations"
-	// table, not a schema; drop it explicitly).
-	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS "schema_migrations"`); err != nil {
-		return err
-	}
-	if _, err := conn.Exec(ctx, `DROP SCHEMA IF EXISTS "drizzle" CASCADE`); err != nil {
-		return err
-	}
-
-	// Re-apply migrations on a fresh state.
-	if err := applyMigrations(databaseURL); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+	if err := gdb.WithContext(ctx).AutoMigrate(schema.AllModels()...); err != nil {
 		return err
 	}
 	return nil
 }
 
-// silence unused fs import (kept for documentation of the embed source type).
-var _ fs.FS
+// quoteIdent wraps an identifier in the dialect's quoting character. MySQL uses
+// backticks; Postgres and SQLite use double quotes. (gorm's mysql driver does
+// NOT enable ANSI_QUOTES, so "..." would be parsed as a string literal.) Table
+// names here are our own (no user input), so quoting is safe.
+func identQuote(gdb *gorm.DB) string {
+	switch gdb.Dialector.Name() {
+	case "mysql":
+		return "`"
+	default:
+		return "\""
+	}
+}
+
+// schemaTableName resolves a model's table name via GORM's statement parser
+// (honors TableName() methods on the models in internal/schema).
+func schemaTableName(gdb *gorm.DB, model interface{}) string {
+	stmt := &gorm.Statement{DB: gdb}
+	_ = stmt.Parse(model)
+	return stmt.Schema.Table
+}
