@@ -1,0 +1,25 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OMC / Claude tooling
+.omc/
+.claude/
+
+# Go build output
+/bin/
+/dist/
+*.exe
+
+# Test cache
+/tmp/
+
+# Node / frontend
+web/dashboard/node_modules/
+web/dashboard/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
