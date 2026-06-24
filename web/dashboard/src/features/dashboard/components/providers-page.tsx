@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Copy,
   Download,
@@ -602,6 +602,29 @@ export function ProvidersPage({
   const [deleteDialogProvider, setDeleteDialogProvider] = useState<ProviderInfo | null>(null)
   const [deletePending, setDeletePending] = useState(false)
 
+  // 当任一子弹框（sync/test/delete/config）打开时，阻止外层渠道弹框被关闭。
+  //
+  // 根因：Radix modal Dialog 用 deferred pointer-down-outside 机制——内层弹框
+  // 卸载的瞬间，外层被重新判定为最高 dismissable 层，于是外层 onOpenChange(false)
+  // 在同一 commit 周期内被触发。此时子 dialog 的 React state 已是 false，任何基于
+  // state 的守卫都会失效。
+  //
+  // 解法：用 ref 同步追踪子弹框状态，并在子弹框关闭后延迟清零。这样外层守卫读取
+  // ref 时（仍在 dismiss 的同一 tick 内），ref 还是 true，守卫即可拦截误关闭。
+  const childDialogOpenRef = useRef(false)
+  const childDialogState =
+    syncDialogOpen || testDialogOpen || deleteDialogOpen || configDialogOpen
+  useEffect(() => {
+    if (childDialogState) {
+      childDialogOpenRef.current = true
+      return
+    }
+    const id = window.setTimeout(() => {
+      childDialogOpenRef.current = false
+    }, 0)
+    return () => window.clearTimeout(id)
+  }, [childDialogState])
+
   const openDeleteDialog = useCallback((provider: ProviderInfo) => {
     setDeleteDialogProvider(provider)
     setDeleteDialogOpen(true)
@@ -962,7 +985,18 @@ export function ProvidersPage({
         )}
       </div>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+      <Dialog
+        open={dialogOpen}
+        // 子弹框（sync/test/delete/config）打开或刚关闭的同一 tick 内，忽略外层
+        // 的关闭请求，避免 Radix 嵌套 modal 的 deferred pointer-down-outside 误关
+        // 渠道弹框（详见 childDialogOpenRef 的注释）。
+        onOpenChange={(open) => {
+          if (!open && childDialogOpenRef.current) {
+            return
+          }
+          setDialogOpen(open)
+        }}
+      >
         <DialogContent className="sm:max-w-5xl">
           <DialogHeader>
             <DialogTitle>
@@ -1262,6 +1296,7 @@ export function ProvidersPage({
                               value={row.model}
                               placeholder="model-id"
                               autoComplete="off"
+                              name="off"
                               onChange={(event) => updateModelRow(row.id, { model: event.target.value })}
                             />
                           </td>

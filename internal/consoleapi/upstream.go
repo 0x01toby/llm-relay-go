@@ -310,35 +310,38 @@ func probeUpstream(target upstreamTarget, model string) testProviderResponse {
 	return out
 }
 
-// listUpstreamModels fetches the upstream's model list. OpenAI providers are
-// queried via GET /models; Anthropic has no public list endpoint, so we fall
-// back to a stable hint set (this mirrors the original service's behavior).
+// listUpstreamModels fetches the upstream's model list via GET {base}/models.
+//
+// Both OpenAI- and Anthropic-flavored upstreams are queried the same way: many
+// Anthropic-compatible gateways (e.g. minimaxi) expose the OpenAI-style /models
+// endpoint. The official Anthropic API has no such endpoint and will 404; per
+// the dashboard's design we return an empty list in that case (the operator can
+// still add models manually in the form) rather than surfacing an error. We do
+// not hard-code any model list, so this always reflects what the upstream
+// actually reports.
 func listUpstreamModels(target upstreamTarget) ([]obj, *httpError) {
-	if target.Type == configstore.Anthropic {
-		// No standard Anthropic models-list endpoint; return a stable hint set.
-		return []obj{
-			{"id": "claude-opus-4-1"},
-			{"id": "claude-sonnet-4-5"},
-			{"id": "claude-3-7-sonnet-latest"},
-			{"id": "claude-3-5-haiku-latest"},
-		}, nil
-	}
-
 	endpoint := strings.TrimRight(target.TargetBaseURL, "/") + "/models"
-	// Some OpenAI-compatible base URLs already include /v1; avoid /v1/v1.
+	// Some base URLs already include /v1; avoid /v1/v1.
 	endpoint = strings.Replace(endpoint, "/v1/v1/models", "/v1/models", 1)
 
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
+		// Invalid base URL is a user input error worth surfacing.
 		return nil, &httpError{http.StatusBadRequest, "无效的 base URL"}
 	}
 	applyAuthHeader(req.Header, target)
 
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
-		return nil, &httpError{http.StatusBadGateway, "请求失败: " + err.Error()}
+		return []obj{}, nil
 	}
 	defer resp.Body.Close()
+
+	// Non-2xx (e.g. official Anthropic's 404 for /models): return empty list
+	// instead of an error so the operator can fall back to manual entry.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return []obj{}, nil
+	}
 
 	var parsed struct {
 		Data []struct {
@@ -346,7 +349,7 @@ func listUpstreamModels(target upstreamTarget) ([]obj, *httpError) {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, &httpError{http.StatusBadGateway, "无法解析上游响应"}
+		return []obj{}, nil
 	}
 	out := make([]obj, 0, len(parsed.Data))
 	for _, m := range parsed.Data {
