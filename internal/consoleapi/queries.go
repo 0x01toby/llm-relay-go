@@ -9,20 +9,33 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/taozhang/llmrelay/internal/pricing"
 	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 // statsOverview holds the aggregate counts computed by computeOverview.
+//
+// Cache fields are split into "request counts" (how many requests hit/created
+// cache) and "token totals" (how many tokens were cache-read/written). The two
+// were previously conflated — cache_hits held SUM(cache_read_input_tokens),
+// i.e. a token count — which made hit_rate = hits/total explode to thousands
+// and cache_misses go negative. The dashboard shows request counts in the
+// hit-rate card and token totals in the cache-read/write cards.
 type statsOverview struct {
-	Total        int64
-	CacheHits    int64
-	CacheCreates int64
-	CacheMisses  int64
-	Errors       int64
-	Failovers    int64
+	Total        int64 // total requests
+	CacheHits    int64 // requests with cache_read_input_tokens > 0
+	CacheCreates int64 // requests with cache_creation_input_tokens > 0
+	CacheMisses  int64 // requests with neither (Total - CacheHits - CacheCreates)
+	Errors       int64 // requests with status null or >= 400
+	Failovers    int64 // requests with a failover_from set
 	InputTokens  int64
 	OutputTokens int64
 	TotalTokens  int64
+	// Token totals surfaced in the dashboard's cache cards.
+	CacheReadTokens      int64 // SUM(cache_read_input_tokens)
+	CacheCreationTokens  int64 // SUM(cache_creation_input_tokens)
+	CachedInputTokens    int64 // SUM(cached_input_tokens)        (OpenAI)
+	ReasoningTokens      int64 // SUM(reasoning_output_tokens)
 }
 
 // computeOverview runs the dashboard's overview aggregate over console_requests
@@ -33,27 +46,38 @@ func computeOverview(ctx context.Context, gdb *gorm.DB, createdAfter int64) (sta
 		COUNT(*),
 		COALESCE(SUM(input_tokens), 0),
 		COALESCE(SUM(output_tokens), 0),
+		COALESCE(SUM(CASE WHEN cache_read_input_tokens > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN cache_creation_input_tokens > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN failover_from IS NOT NULL AND failover_from != '' THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(cache_read_input_tokens), 0),
 		COALESCE(SUM(cache_creation_input_tokens), 0),
-		COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN failover_from IS NOT NULL AND failover_from != '' THEN 1 ELSE 0 END), 0)
+		COALESCE(SUM(cached_input_tokens), 0),
+		COALESCE(SUM(reasoning_output_tokens), 0)
 	`)
 	if createdAfter > 0 {
 		q = q.Where("created_at >= ?", createdAfter)
 	}
-	var total, inTok, outTok, cacheRead, cacheCreate, errors, failovers int64
+	var total, inTok, outTok, cacheHitReqs, cacheCreateReqs, errors, failovers int64
+	var cacheReadTok, cacheCreateTok, cachedInputTok, reasoningTok int64
 	row := q.Row()
-	if err := row.Scan(&total, &inTok, &outTok, &cacheRead, &cacheCreate, &errors, &failovers); err != nil {
+	if err := row.Scan(&total, &inTok, &outTok, &cacheHitReqs, &cacheCreateReqs, &errors, &failovers,
+		&cacheReadTok, &cacheCreateTok, &cachedInputTok, &reasoningTok); err != nil {
 		return statsOverview{}, err
 	}
-	misses := total - cacheRead - cacheCreate
+	misses := total - cacheHitReqs - cacheCreateReqs
 	if misses < 0 {
 		misses = 0
 	}
 	return statsOverview{
 		Total: total, InputTokens: inTok, OutputTokens: outTok,
-		TotalTokens: inTok + outTok, CacheHits: cacheRead, CacheCreates: cacheCreate,
-		CacheMisses: misses, Errors: errors, Failovers: failovers,
+		TotalTokens: inTok + outTok,
+		CacheHits: cacheHitReqs, CacheCreates: cacheCreateReqs, CacheMisses: misses,
+		Errors: errors, Failovers: failovers,
+		CacheReadTokens:     cacheReadTok,
+		CacheCreationTokens: cacheCreateTok,
+		CachedInputTokens:   cachedInputTok,
+		ReasoningTokens:     reasoningTok,
 	}, nil
 }
 
@@ -69,15 +93,20 @@ type statsBucket struct {
 
 // computeBuckets groups console_requests by groupCol and aggregates. groupCol
 // is one of route_prefix / request_model / api_key_name (controlled by the
-// caller; never user input).
+// caller; never user input). CacheHits is a request count (requests with
+// cache_read_input_tokens > 0) so the dashboard's per-bucket hit rate stays in
+// [0, 100].
 func computeBuckets(ctx context.Context, gdb *gorm.DB, groupCol string, createdAfter int64) ([]statsBucket, error) {
+	// Aggregate columns are aliased to match the row struct's exported field
+	// names so GORM's Scan maps them correctly (the raw COUNT(*)/SUM(...) names
+	// wouldn't match Key/Requests/etc.).
 	q := gdb.WithContext(ctx).Model(&schema.ConsoleRequest{}).Select(fmt.Sprintf(`
-		%s,
-		COUNT(*),
-		COALESCE(SUM(input_tokens), 0),
-		COALESCE(SUM(output_tokens), 0),
-		COALESCE(SUM(cache_read_input_tokens), 0),
-		COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0)
+		%s AS key,
+		COUNT(*) AS requests,
+		COALESCE(SUM(input_tokens), 0) AS input_tok,
+		COALESCE(SUM(output_tokens), 0) AS output_tok,
+		COALESCE(SUM(CASE WHEN cache_read_input_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_r,
+		COALESCE(SUM(CASE WHEN response_status IS NULL OR response_status >= 400 THEN 1 ELSE 0 END), 0) AS errs
 	`, groupCol))
 	if createdAfter > 0 {
 		q = q.Where("created_at >= ?", createdAfter)
@@ -86,7 +115,7 @@ func computeBuckets(ctx context.Context, gdb *gorm.DB, groupCol string, createdA
 		Key      string
 		Requests int64
 		InputTok int64
-		OutputTo int64
+		OutputTok int64
 		CacheR   int64
 		Errs     int64
 	}
@@ -98,7 +127,7 @@ func computeBuckets(ctx context.Context, gdb *gorm.DB, groupCol string, createdA
 	for _, r := range rows {
 		out = append(out, statsBucket{
 			Key: r.Key, Requests: r.Requests, InputTokens: r.InputTok,
-			OutputTokens: r.OutputTo, CacheHits: r.CacheR, Errors: r.Errs,
+			OutputTokens: r.OutputTok, CacheHits: r.CacheR, Errors: r.Errs,
 		})
 	}
 	return out, nil
@@ -128,6 +157,21 @@ type tsPoint struct {
 	Requests    int64
 	Errors      int64
 	Tokens      int64
+}
+
+// timeseriesBucketMs returns the bucket size (ms) computeTimeseries will use
+// for the given range. MUST stay in sync with computeTimeseries so the cost
+// pass buckets requests into the same buckets the chart renders.
+func timeseriesBucketMs(createdAfter int64) int64 {
+	now := time.Now().UnixMilli()
+	switch {
+	case createdAfter > now-int64(time.Hour/time.Millisecond):
+		return 60 * 1000
+	case createdAfter > now-int64(7*24*time.Hour/time.Millisecond):
+		return 300 * 1000
+	default:
+		return 3600 * 1000
+	}
 }
 
 // computeTimeseries buckets requests by time based on the active range. Bucket
@@ -204,6 +248,105 @@ func alignDown(ms int64, granularity int64) int64 {
 	return (ms / granularity) * granularity
 }
 
+// costBreakdown holds the USD cost split into its four pricing components. The
+// dashboard's "成本拆分" (cost breakdown) card renders these four plus total.
+type costBreakdown struct {
+	Input      float64
+	Output     float64
+	CacheRead  float64
+	CacheWrite float64
+}
+
+func (c costBreakdown) Total() float64 {
+	return c.Input + c.Output + c.CacheRead + c.CacheWrite
+}
+
+// costRow is a lightweight projection of one request, just the columns needed
+// to price it. Pulling only these (no payloads/headers) keeps the cost pass
+// cheap relative to the row size.
+type costRow struct {
+	CreatedAt    int64
+	RequestModel string
+	ResponseModel *string
+	InputTokens  int64
+	OutputTokens int64
+	CacheRead    int64
+	CacheCreate  int64
+}
+
+// computeCosts prices every request in range using the in-memory catalog and
+// returns both the overall breakdown and a per-time-bucket breakdown. One query
+// feeds the overview cost cards and the cost line on the time-series chart, so
+// we don't walk the table twice. Requests whose model has no catalog pricing
+// are skipped (their components stay 0 — same policy as the per-request list).
+func computeCosts(ctx context.Context, gdb *gorm.DB, cat catalogLooker, createdAfter, bucketMs int64) (costBreakdown, map[int64]costBreakdown) {
+	total := costBreakdown{}
+	byBucket := map[int64]costBreakdown{}
+	if cat == nil {
+		return total, byBucket
+	}
+
+	var rows []costRow
+	q := gdb.WithContext(ctx).Model(&schema.ConsoleRequest{}).Select(
+		"created_at", "request_model", "response_model",
+		"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+	)
+	if createdAfter > 0 {
+		q = q.Where("created_at >= ?", createdAfter)
+	}
+	if err := q.Scan(&rows).Error; err != nil {
+		return total, byBucket
+	}
+
+	for _, row := range rows {
+		// Resolve the model id: prefer the model the upstream actually used
+		// (response_model), fall back to the requested one.
+		modelID := row.RequestModel
+		if row.ResponseModel != nil && *row.ResponseModel != "" {
+			modelID = *row.ResponseModel
+		}
+		p := cat.LookupPricing(modelID)
+		if p == nil {
+			continue
+		}
+		cb := priceRow(row, p)
+		total.Input += cb.Input
+		total.Output += cb.Output
+		total.CacheRead += cb.CacheRead
+		total.CacheWrite += cb.CacheWrite
+
+		if bucketMs > 0 {
+			bk := alignDown(row.CreatedAt, bucketMs)
+			cur := byBucket[bk]
+			cur.Input += cb.Input
+			cur.Output += cb.Output
+			cur.CacheRead += cb.CacheRead
+			cur.CacheWrite += cb.CacheWrite
+			byBucket[bk] = cur
+		}
+	}
+	return total, byBucket
+}
+
+// priceRow computes the four cost components for one request from its token
+// counts and the model's per-1M-token prices.
+func priceRow(row costRow, p *pricing.ModelPricing) costBreakdown {
+	cb := costBreakdown{}
+	if p.Input != nil {
+		cb.Input = float64(row.InputTokens) / pricing.TokensPerMillion * *p.Input
+	}
+	if p.Output != nil {
+		cb.Output = float64(row.OutputTokens) / pricing.TokensPerMillion * *p.Output
+	}
+	if p.CacheRead != nil && row.CacheRead > 0 {
+		cb.CacheRead = float64(row.CacheRead) / pricing.TokensPerMillion * *p.CacheRead
+	}
+	if p.CacheWrite != nil && row.CacheCreate > 0 {
+		cb.CacheWrite = float64(row.CacheCreate) / pricing.TokensPerMillion * *p.CacheWrite
+	}
+	return cb
+}
+
 // distinctColumn returns the distinct non-null, non-empty values of col from
 // console_requests (col is controlled by the caller; never user input).
 func distinctColumn(ctx context.Context, gdb *gorm.DB, col string) []string {
@@ -255,26 +398,6 @@ func loadModelOverrides(ctx context.Context, gdb *gorm.DB) (map[string]modelOver
 			}
 		}
 		out[r.ChannelName+":"+r.ModelID] = entry
-	}
-	return out, nil
-}
-
-// loadModelPricing returns a map keyed by model id → pricing obj, sourced from
-// model_catalog_cache.
-func loadModelPricing(ctx context.Context, gdb *gorm.DB) (map[string]map[string]interface{}, error) {
-	var rows []schema.ModelCatalogCache
-	if err := gdb.WithContext(ctx).Where("pricing_json IS NOT NULL AND pricing_json != ''").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := map[string]map[string]interface{}{}
-	for _, r := range rows {
-		if r.PricingJSON == nil || *r.PricingJSON == "" {
-			continue
-		}
-		var p map[string]interface{}
-		if err := json.Unmarshal([]byte(*r.PricingJSON), &p); err == nil {
-			out[r.ModelID] = p
-		}
 	}
 	return out, nil
 }
