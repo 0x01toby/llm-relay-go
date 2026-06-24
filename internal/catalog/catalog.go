@@ -1,16 +1,27 @@
-// Package catalog fetches and caches model metadata (context windows and
-// pricing) from models.dev. It is a port of src/model-catalog.ts +
-// src/catalog-db.ts + the fetch half of src/pricing.ts.
+// Package catalog loads and caches model metadata (context windows and pricing)
+// from models.dev.
 //
-// Three-layer cache with singleflight (mirrors the original):
-//   - In-memory maps (contextWindow, pricing) under a RWMutex, 24h TTL.
-//   - DB cache (model_catalog_cache) warmed at boot, persisted on network fetch.
-//   - Network fetch from https://models.dev/api.json (10s timeout), deduped
-//     via singleflight so concurrent callers share one fetch.
+// The catalog is held entirely in memory — there is no DB persistence layer.
+// At boot the vendored models.dev catalog (models-dev.json, go:embed) is parsed
+// into in-memory maps so pricing is available with zero external dependencies.
+// A background refresh then pulls the live catalog from
+// https://models.dev/api.json (10s timeout, 24h TTL) and updates the maps;
+// concurrent refreshes are deduped via singleflight.
+//
+// All lookups (LookupContext / LookupPricing / PricingMap) are lock-free reads
+// against the in-memory maps, so the cost column on every request list/detail
+// is computed without a DB hit.
+//
+// models.dev's JSON is keyed by provider at the top level, with each provider
+// exposing its models under a nested "models" object. The same model id (e.g.
+// "claude-opus-4-5") is offered by several providers; we flatten to a single
+// per-model-id entry, preferring the first-party provider (anthropic/openai)
+// whose pricing is the most complete and authoritative.
 package catalog
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -18,23 +29,33 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/taozhang/llmrelay/internal/pricing"
-	"github.com/taozhang/llmrelay/internal/schema"
 )
 
 const (
-	modelsDevURL  = "https://models.dev/api.json"
-	fetchTimeout  = 10 * time.Second
-	cacheTTL      = 24 * time.Hour
-	batchSize     = 500
+	modelsDevURL = "https://models.dev/api.json"
+	fetchTimeout = 10 * time.Second
+	cacheTTL     = 24 * time.Hour
 )
 
-// Service owns the context/pricing caches and the models.dev fetcher.
+//go:embed models-dev.json
+var vendoredCatalogFS embed.FS
+
+// vendoredCatalog is the lazily-decoded models-dev.json embedded in the binary.
+var vendoredCatalog []byte
+
+func init() {
+	b, err := vendoredCatalogFS.ReadFile("models-dev.json")
+	if err != nil {
+		log.Printf("[catalog] could not read vendored models-dev.json: %v", err)
+		return
+	}
+	vendoredCatalog = b
+}
+
+// Service owns the in-memory context/pricing caches and the models.dev fetcher.
 type Service struct {
-	db         *gorm.DB
 	httpClient *http.Client
 
 	mu             sync.RWMutex
@@ -45,47 +66,19 @@ type Service struct {
 	group          singleflight.Group
 }
 
-// New builds a catalog Service.
-func New(gdb *gorm.DB) *Service {
+// New builds an in-memory catalog Service. Pricing is populated by WarmFromEmbed
+// (and optionally EnsureLoaded); lookups return nil/0 until then.
+func New() *Service {
 	return &Service{
-		db:         gdb,
 		httpClient: &http.Client{Timeout: fetchTimeout},
 	}
 }
 
-// WarmFromDB loads the catalog from the model_catalog_cache table. Returns true
-// if the DB data is fresh (< 24h), so the caller can skip the network fetch.
-func (s *Service) WarmFromDB(ctx context.Context) (bool, error) {
-	var rows []schema.ModelCatalogCache
-	if err := s.db.WithContext(ctx).Find(&rows).Error; err != nil {
-		return false, err
-	}
-
-	ctxCache := map[string]int{}
-	priceCache := map[string]*pricing.ModelPricing{}
-	var maxFetched int64
-	for _, row := range rows {
-		if row.ContextWindow != nil {
-			ctxCache[row.ModelID] = *row.ContextWindow
-		}
-		if row.PricingJSON != nil && *row.PricingJSON != "" {
-			if p := parsePricing(*row.PricingJSON); p != nil {
-				priceCache[row.ModelID] = p
-			}
-		}
-		if row.FetchedAt > maxFetched {
-			maxFetched = row.FetchedAt
-		}
-	}
-
-	s.mu.Lock()
-	s.contextCache = ctxCache
-	s.pricingCache = priceCache
-	s.loadedAt = time.Now()
-	s.mu.Unlock()
-
-	fresh := maxFetched > 0 && time.Since(time.UnixMilli(maxFetched)) < cacheTTL
-	return fresh, nil
+// WarmFromEmbed parses the vendored models-dev.json baked into the binary into
+// the in-memory caches. This is the boot path: it gives the gateway pricing
+// immediately, with no DB or network dependency.
+func (s *Service) WarmFromEmbed() error {
+	return s.loadFromBytes(vendoredCatalog, false)
 }
 
 // LookupContext returns the context window for a model, or 0 if unknown.
@@ -100,6 +93,19 @@ func (s *Service) LookupPricing(modelID string) *pricing.ModelPricing {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.pricingCache[modelID]
+}
+
+// PricingMap returns a snapshot copy of the whole pricing cache keyed by model
+// id (each value is the canonical pricing object the dashboard renders). Used
+// by the Models page to enrich every configured model in one pass.
+func (s *Service) PricingMap() map[string]map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]map[string]interface{}, len(s.pricingCache))
+	for id, p := range s.pricingCache {
+		out[id] = canonicalPricingMap(p)
+	}
+	return out
 }
 
 // IsFresh reports whether the in-memory cache is within its TTL.
@@ -124,7 +130,7 @@ func (s *Service) EnsureLoaded(ctx context.Context) error {
 	return err
 }
 
-// refreshFromNetwork fetches models.dev and updates both caches + DB.
+// refreshFromNetwork fetches models.dev and updates the in-memory caches.
 func (s *Service) refreshFromNetwork(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsDevURL, nil)
 	if err != nil {
@@ -143,48 +149,41 @@ func (s *Service) refreshFromNetwork(ctx context.Context) error {
 		return err
 	}
 
-	ctxCache := map[string]int{}
-	priceCache := map[string]*pricing.ModelPricing{}
-	for modelID, data := range raw {
-		var m struct {
-			Context *int `json:"limit"`
-			Pricing struct {
-				Input      *float64 `json:"prompt"`
-				Output     *float64 `json:"completion"`
-				CacheRead  *float64 `json:"cachedPrompt"`
-				CacheWrite *float64 `json:"writeCache"`
-			} `json:"pricing"`
-		}
-		if err := json.Unmarshal(data, &m); err != nil {
-			continue
-		}
-		if m.Context != nil {
-			ctxCache[modelID] = *m.Context
-		}
-		p := &pricing.ModelPricing{
-			Input: m.Pricing.Input, Output: m.Pricing.Output,
-			CacheRead: m.Pricing.CacheRead, CacheWrite: m.Pricing.CacheWrite,
-		}
-		if p.Input != nil || p.Output != nil {
-			priceCache[modelID] = p
-		}
+	// Flatten the provider-keyed object into a model-keyed object (first-party
+	// providers winning), then load it into memory.
+	flat := flattenModelsDev(raw)
+	b, _ := json.Marshal(flat)
+	return s.loadFromBytes(b, true)
+}
+
+// loadFromBytes parses a catalog object (either provider-keyed raw or
+// model-keyed flattened) into the in-memory caches. When fromNetwork is true
+// the fetch timestamp is stamped.
+func (s *Service) loadFromBytes(data []byte, fromNetwork bool) error {
+	ctxCache, priceCache, err := parseModelsDev(data)
+	if err != nil {
+		return err
 	}
 
 	s.mu.Lock()
 	s.contextCache = ctxCache
 	s.pricingCache = priceCache
 	s.loadedAt = time.Now()
-	s.networkFetched = time.Now()
+	if fromNetwork {
+		s.networkFetched = time.Now()
+	}
 	s.mu.Unlock()
 
-	// Persist to DB (best-effort, non-blocking).
-	go s.persistToDB(ctxCache, priceCache)
-	log.Printf("[catalog] refreshed from models.dev: %d context + %d pricing entries", len(ctxCache), len(priceCache))
+	label := "vendored fallback"
+	if fromNetwork {
+		label = "network refresh"
+	}
+	log.Printf("[catalog] loaded (%s): %d context + %d pricing entries", label, len(ctxCache), len(priceCache))
 	return nil
 }
 
-// onFetchFailure sets an empty cache so subsequent calls don't immediately
-// retry within the TTL (mirrors refreshFromNetwork's failure handling).
+// onFetchFailure leaves the existing cache intact but stamps loadedAt so a
+// transient network blip doesn't trigger a retry storm within the TTL.
 func (s *Service) onFetchFailure() {
 	s.mu.Lock()
 	if s.contextCache == nil {
@@ -194,75 +193,21 @@ func (s *Service) onFetchFailure() {
 	s.mu.Unlock()
 }
 
-// persistToDB upserts the cache into model_catalog_cache in batches.
-func (s *Service) persistToDB(ctxCache map[string]int, priceCache map[string]*pricing.ModelPricing) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Union of model IDs from both maps.
-	ids := map[string]bool{}
-	for id := range ctxCache {
-		ids[id] = true
+// canonicalPricingMap renders a ModelPricing as the canonical object the
+// dashboard renders: {"input":..,"output":..,"cache_read":..,"cache_write":..}.
+func canonicalPricingMap(p *pricing.ModelPricing) map[string]interface{} {
+	out := map[string]interface{}{}
+	if p.Input != nil {
+		out["input"] = *p.Input
 	}
-	for id := range priceCache {
-		ids[id] = true
+	if p.Output != nil {
+		out["output"] = *p.Output
 	}
-
-	now := time.Now().UnixMilli()
-	for id := range ids {
-		ctxW := ctxCache[id]
-		var pricingStr *string
-		if p := priceCache[id]; p != nil {
-			b, _ := json.Marshal(p)
-			str := string(b)
-			pricingStr = &str
-		}
-		var ctxPtr *int
-		if ctxW > 0 {
-			ctxPtr = &ctxW
-		}
-		row := schema.ModelCatalogCache{
-			ModelID:       id,
-			ContextWindow: ctxPtr,
-			PricingJSON:   pricingStr,
-			FetchedAt:     now,
-		}
-		if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "model_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"context_window", "pricing_json", "fetched_at"}),
-		}).Create(&row).Error; err != nil {
-			log.Printf("[catalog] persist error for %s: %v", id, err)
-		}
+	if p.CacheRead != nil {
+		out["cache_read"] = *p.CacheRead
 	}
-}
-
-// parsePricing decodes a pricing_json value into a ModelPricing.
-func parsePricing(s string) *pricing.ModelPricing {
-	// model_catalog_cache stores the models.dev pricing sub-object; tolerate
-	// either the flat {prompt, completion, ...} shape or a wrapped object.
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
-		return nil
+	if p.CacheWrite != nil {
+		out["cache_write"] = *p.CacheWrite
 	}
-	p := &pricing.ModelPricing{}
-	p.Input = numField(m, "prompt", "input")
-	p.Output = numField(m, "completion", "output")
-	p.CacheRead = numField(m, "cachedPrompt", "cache_read")
-	p.CacheWrite = numField(m, "writeCache", "cache_write")
-	if p.Input == nil && p.Output == nil {
-		return nil
-	}
-	return p
-}
-
-func numField(m map[string]json.RawMessage, keys ...string) *float64 {
-	for _, k := range keys {
-		if raw, ok := m[k]; ok {
-			var f float64
-			if err := json.Unmarshal(raw, &f); err == nil {
-				return &f
-			}
-		}
-	}
-	return nil
+	return out
 }

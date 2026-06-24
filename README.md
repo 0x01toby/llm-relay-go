@@ -182,6 +182,27 @@ never drops columns), which is dialect-agnostic. The `/health` endpoint and the
 dashboard's usage page report the active backend. Note: SQLite uses a pure-Go
 driver (`glebarez/sqlite`), so the build stays CGO-free (`CGO_ENABLED=0`).
 
+## Model pricing
+
+Per-model pricing (USD per 1M tokens, used for the dashboard's cost column) is
+sourced from [models.dev](https://models.dev) and **committed to the repo** as
+`internal/catalog/models-dev.json`, which the gateway `//go:embed`s at build
+time. At boot the catalog is parsed into memory — pricing lookups never touch
+the DB or the network.
+
+Update prices periodically by running the sync script, then commit + redeploy:
+
+```bash
+./scripts/sync-prices.sh             # download + verify (no commit)
+./scripts/sync-prices.sh --commit    # download + verify + git commit
+```
+
+The same model id offered by multiple providers (e.g. `claude-opus-4-5` via
+anthropic, azure, …) collapses to one entry, preferring the first-party provider
+(anthropic / openai) whose pricing is most complete. Per-(channel, model)
+manual overrides can still be set from the dashboard's Models page (stored in
+`model_metadata_overrides`) and take precedence over the catalog.
+
 ## Run the spike
 
 ```bash
@@ -225,7 +246,7 @@ internal/
   logtasks/             async log orchestration (WaitGroup + per-key serialization)
   tokenest/             tiktoken-based token estimation with fallbacks
   pricing/              per-model cost calculation
-  catalog/              models.dev fetcher + DB cache (singleflight, 24h TTL)
+  catalog/              models.dev pricing catalog (//go:embed, in-memory)
   consoleauth/          cookie auth (FNV-1a hash, byte-for-byte port)
   consoleapi/           /__console/* API routes for the dashboard
   web/                  embedded SPA static serving

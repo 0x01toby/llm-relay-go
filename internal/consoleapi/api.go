@@ -24,11 +24,13 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/taozhang/llmrelay/internal/catalog"
 	"github.com/taozhang/llmrelay/internal/configstore"
 	"github.com/taozhang/llmrelay/internal/consoleauth"
 	"github.com/taozhang/llmrelay/internal/consolestore"
 	"github.com/taozhang/llmrelay/internal/cors"
 	"github.com/taozhang/llmrelay/internal/db"
+	"github.com/taozhang/llmrelay/internal/pricing"
 	"github.com/taozhang/llmrelay/internal/repo"
 	"github.com/taozhang/llmrelay/internal/routing"
 	"github.com/taozhang/llmrelay/internal/schema"
@@ -36,31 +38,49 @@ import (
 
 // API holds all the dependencies the console routes need.
 type API struct {
-	password string
-	gdb      *gorm.DB
-	dialect  db.Dialect
-	store    *configstore.Store
-	provider *repo.ProviderRepo
-	alias    *repo.AliasRepo
-	apikey   *repo.APIKeyRepo
-	settings *repo.SettingsRepo
-	requests *consolestore.Repository
+	password  string
+	gdb       *gorm.DB
+	dialect   db.Dialect
+	store     *configstore.Store
+	catalog   catalogLooker
+	provider  *repo.ProviderRepo
+	alias     *repo.AliasRepo
+	apikey    *repo.APIKeyRepo
+	settings  *repo.SettingsRepo
+	requests  *consolestore.Repository
+	maxRecords int // retention cap, surfaced in the stats overview
+}
+
+// catalogLooker is the subset of catalog.Service the API needs: looking up a
+// model's pricing. Defined as an interface so tests can stub it.
+type catalogLooker interface {
+	LookupPricing(modelID string) *pricing.ModelPricing
+	LookupContext(modelID string) int
+	// PricingMap returns every priced model (keyed by model id) for the Models
+	// page. Implementations may return nil when no catalog is configured.
+	PricingMap() map[string]map[string]interface{}
 }
 
 // New builds a console API handler. dialect is the detected backend, surfaced
-// in the stats response's storage_backend field.
-func New(gdb *gorm.DB, dialect db.Dialect, store *configstore.Store, password string, maxRecords int) *API {
-	return &API{
-		password: password,
-		gdb:      gdb,
-		dialect:  dialect,
-		store:    store,
-		provider: repo.NewProviderRepo(gdb),
-		alias:    repo.NewAliasRepo(gdb),
-		apikey:   repo.NewAPIKeyRepo(gdb),
-		settings: repo.NewSettingsRepo(gdb),
-		requests: consolestore.New(gdb, maxRecords),
+// in the stats response's storage_backend field. cat supplies per-model
+// pricing used to compute the cost column; pass nil to disable cost.
+func New(gdb *gorm.DB, dialect db.Dialect, store *configstore.Store, cat *catalog.Service, password string, maxRecords int) *API {
+	a := &API{
+		password:   password,
+		gdb:        gdb,
+		dialect:    dialect,
+		store:      store,
+		provider:   repo.NewProviderRepo(gdb),
+		alias:      repo.NewAliasRepo(gdb),
+		apikey:     repo.NewAPIKeyRepo(gdb),
+		settings:   repo.NewSettingsRepo(gdb),
+		requests:   consolestore.New(gdb, maxRecords),
+		maxRecords: maxRecords,
 	}
+	if cat != nil {
+		a.catalog = cat
+	}
+	return a
 }
 
 // Routes returns the HTTP handler for /__console/*. Mount it at that prefix.
@@ -154,11 +174,15 @@ func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) handleRequests(w http.ResponseWriter, r *http.Request) {
 	f := parseListFilter(r)
-	items, total, err := a.requests.List(r.Context(), f)
+	rows, total, err := a.requests.List(r.Context(), f)
 	if err != nil {
 		log.Printf("[console] list requests: %v", err)
 		writeJSON(w, http.StatusInternalServerError, obj{"error": "failed to list requests"})
 		return
+	}
+	items := make([]obj, 0, len(rows))
+	for i := range rows {
+		items = append(items, buildListItem(&rows[i], a.catalog))
 	}
 	writeJSON(w, http.StatusOK, obj{"ok": true, "requests": items, "total": total})
 }
@@ -692,14 +716,23 @@ func parseListFilter(r *http.Request) consolestore.ListFilter {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
-	return consolestore.ListFilter{
-		Limit:  limit,
-		Offset: offset,
-		Route:  q.Get("route"),
-		Model:  q.Get("model"),
-		Status: q.Get("status"),
-		Search: q.Get("search"),
+	f := consolestore.ListFilter{
+		Limit:     limit,
+		Offset:    offset,
+		Route:     q.Get("route"),
+		Model:     q.Get("model"),
+		Status:    q.Get("status"),
+		Search:    q.Get("search"),
+		SortBy:    q.Get("sort_by"),
+		SortOrder: q.Get("sort_order"),
 	}
+	if f.SortBy == "" {
+		f.SortBy = "created_at"
+	}
+	if f.SortOrder == "" {
+		f.SortOrder = "desc"
+	}
+	return f
 }
 
 // quiet unused-import guard for context (used in some handlers).
@@ -714,40 +747,76 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	createdAfter := parseRangeMs(r.URL.Query().Get("range"))
 	ctx := r.Context()
 
-	overview, err := computeOverview(ctx, a.gdb, createdAfter)
+	// All stats read from the pre-aggregated request_stats_5m rollup table
+	// (populated by the background scheduler), so they stay accurate even after
+	// old console_requests rows are pruned. Cost columns are pre-priced at
+	// rollup time, so no per-row pricing pass is needed here.
+	overview, err := computeOverviewFromRollup(ctx, a.gdb, createdAfter)
 	if err != nil {
 		log.Printf("[console] stats overview: %v", err)
 		writeJSON(w, http.StatusInternalServerError, obj{"error": "failed to compute stats"})
 		return
 	}
+	// hit_rate is the share of requests that read from cache, as a 0–100
+	// percent (the dashboard renders it via toFixed(1) + "%").
 	hitRate := 0.0
 	if overview.Total > 0 {
-		hitRate = float64(overview.CacheHits) / float64(overview.Total)
+		hitRate = float64(overview.CacheHits) / float64(overview.Total) * 100
+	}
+	cacheMisses := overview.Total - overview.CacheHits - overview.CacheCreates
+	if cacheMisses < 0 {
+		cacheMisses = 0
 	}
 
-	routeBuckets, _ := computeBuckets(ctx, a.gdb, "route_prefix", createdAfter)
-	modelBuckets, _ := computeBuckets(ctx, a.gdb, "request_model", createdAfter)
-	clientBuckets, _ := computeBuckets(ctx, a.gdb, "api_key_name", createdAfter)
+	routeBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "route_prefix", createdAfter)
+	modelBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "request_model", createdAfter)
+	clientBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "api_key_name", createdAfter)
 
-	routeObj := bucketsToObj(routeBuckets)
-	modelObj := bucketsToObj(modelBuckets)
-	clientObj := bucketsToObj(clientBuckets)
-	ts := computeTimeseries(ctx, a.gdb, createdAfter)
+	routeObj := rollupBucketsToObj(routeBuckets)
+	modelObj := rollupBucketsToObj(modelBuckets)
+	clientObj := rollupBucketsToObj(clientBuckets)
+	ts := computeTimeseriesFromRollup(ctx, a.gdb, createdAfter)
+
+	// Latency averages from pre-aggregated sums.
+	var avgFirstChunk, avgFirstToken, avgDuration *float64
+	if overview.CountTimed > 0 {
+		d := float64(overview.SumDurationMs) / float64(overview.CountTimed)
+		avgDuration = &d
+		// first-token avg uses count_timed as the denominator too (a timed
+		// request has a first-token timestamp in the common case).
+		ft := float64(overview.SumFirstTokenMs) / float64(overview.CountTimed)
+		avgFirstToken = &ft
+		avgFirstChunk = &ft // same column in rollup; distinct on the request row
+	}
+	totalCost := overview.InputCost + overview.OutputCost + overview.CacheReadCost + overview.CacheWriteCost
 
 	writeJSON(w, http.StatusOK, obj{
 		"overview": obj{
-			"total":                overview.Total,
-			"cache_hits":           overview.CacheHits,
-			"cache_creates":        overview.CacheCreates,
-			"cache_misses":         overview.CacheMisses,
-			"errors":               overview.Errors,
-			"failovers":            overview.Failovers,
-			"hit_rate":             hitRate,
-			"total_input_tokens":   overview.InputTokens,
-			"total_output_tokens":  overview.OutputTokens,
-			"total_tokens":         overview.TotalTokens,
-			"storage_backend":      a.dialect.String(),
-			"retention_max_records": 50000,
+			"total":                          overview.Total,
+			"cache_hits":                     overview.CacheHits,
+			"cache_creates":                  overview.CacheCreates,
+			"cache_misses":                   cacheMisses,
+			"errors":                         overview.Errors,
+			"failovers":                      overview.Failovers,
+			"hit_rate":                       hitRate,
+			"total_input_tokens":             overview.InputTokens,
+			"total_output_tokens":            overview.OutputTokens,
+			"total_tokens":                   overview.InputTokens + overview.OutputTokens,
+			"total_cache_read_tokens":        overview.CacheReadTokens,
+			"total_cache_creation_tokens":    overview.CacheCreationTokens,
+			"total_cached_input_tokens":      overview.CachedInputTokens,
+			"total_reasoning_output_tokens":  overview.ReasoningTokens,
+			"total_cost":                     roundUSD(totalCost),
+			"total_input_cost":               roundUSD(overview.InputCost),
+			"total_output_cost":              roundUSD(overview.OutputCost),
+			"total_cache_read_cost":          roundUSD(overview.CacheReadCost),
+			"total_cache_write_cost":         roundUSD(overview.CacheWriteCost),
+			"avg_first_chunk_ms":             avgFirstChunk,
+			"avg_first_token_ms":             avgFirstToken,
+			"avg_duration_ms":                avgDuration,
+			"avg_generation_ms":              nil,
+			"storage_backend":                a.dialect.String(),
+			"retention_max_records":          a.maxRecords,
 		},
 		"stats": obj{
 			"routes":  routeObj,
@@ -1044,9 +1113,13 @@ func (a *API) handleModels(w http.ResponseWriter, r *http.Request) {
 	resolver := routing.NewResolver(a.store.Snapshot())
 	models := resolver.Models()
 
-	// Load overrides and per-model pricing from DB.
+	// Overrides are per-(channel, model) from the DB; pricing comes from the
+	// in-memory catalog keyed by model id.
 	overrides, _ := loadModelOverrides(r.Context(), a.gdb)
-	pricing, _ := loadModelPricing(r.Context(), a.gdb)
+	var pricing map[string]map[string]interface{}
+	if a.catalog != nil {
+		pricing = a.catalog.PricingMap()
+	}
 
 	out := obj{"openai": []obj{}, "anthropic": []obj{}}
 	for _, m := range models {
@@ -1055,15 +1128,25 @@ func (a *API) handleModels(w http.ResponseWriter, r *http.Request) {
 			"channelName": m.ChannelName,
 			"type":        string(m.Type),
 		}
-		if m.Context != nil {
-			entry["context"] = *m.Context
-		}
 		key := m.ChannelName + ":" + m.ID
-		if p, ok := pricing[key]; ok {
-			entry["pricing"] = p
+		// Context length precedence: manual override > provider config > catalog
+		// (models.dev). The provider config (m.Context) is usually empty because
+		// operators rarely type it in; the catalog fills it in automatically.
+		if ov, ok := overrides[key]; ok && ov.Context != nil {
+			entry["context"] = *ov.Context
+		} else if m.Context != nil {
+			entry["context"] = *m.Context
+		} else if a.catalog != nil {
+			if ctxWindow := a.catalog.LookupContext(m.ID); ctxWindow > 0 {
+				entry["context"] = ctxWindow
+			}
 		}
 		if ov, ok := overrides[key]; ok {
 			entry["override"] = overrideEntryToObj(ov)
+		}
+		// Pricing is keyed by model id (catalog is cross-provider).
+		if p, ok := pricing[m.ID]; ok {
+			entry["pricing"] = p
 		}
 		// Models with channelName="virtual-route" are aliases — group by the
 		// model's resolved type from the alias target. The resolver already
