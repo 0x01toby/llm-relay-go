@@ -302,20 +302,34 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 	}
 
 	// Build the upstream HTTP request.
+	//
+	// First-byte timeout: we create a cancellable context for the upstream
+	// request, but enforce the first-byte deadline via a timer that calls cancel
+	// only if the response headers haven't arrived yet. Once headers arrive
+	// (httpClient.Do returns), we stop the timer so the context stays alive for
+	// the full streaming read — otherwise a 30s first-byte timeout would
+	// truncate any stream that takes longer than 30s to complete, even though
+	// the first byte arrived in milliseconds.
 	ctx := r.Context()
 	timeoutMs := SelectFirstByteTimeout(r.URL.Path, targetURL, ts, streamReq)
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	var firstByteTimer *time.Timer
 	if timeoutMs > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
-		defer cancel()
+		firstByteTimer = time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
+			reqCancel()
+		})
 	}
 
 	var bodyReader io.Reader
 	if r.Method == http.MethodPost {
 		bodyReader = bytes.NewReader(forwardBody)
 	}
-	upReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bodyReader)
+	upReq, err := http.NewRequestWithContext(reqCtx, r.Method, targetURL, bodyReader)
 	if err != nil {
+		if firstByteTimer != nil {
+			firstByteTimer.Stop()
+		}
+		reqCancel()
 		h.writeTerminalError(w, route, 502, "Upstream request failed", err.Error())
 		return 502, false
 	}
@@ -327,8 +341,10 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 	resp, err := h.httpClient.Do(upReq)
 	log.Printf("[DEBUG] httpClient.Do: err=%v resp=%v targetURL=%s", err, resp != nil, targetURL)
 	if err != nil {
-		// Network/timeout error: decide whether to retry.
-		isTimeout := ctx.Err() == context.DeadlineExceeded
+		// Did the first-byte timer fire? Stop() returns false if it already ran.
+		timerFired := firstByteTimer != nil && !firstByteTimer.Stop()
+		reqCancel()
+		isTimeout := timerFired
 		trigger := FailoverTrigger{Kind: TriggerNetworkError}
 		if isTimeout {
 			trigger.Kind = TriggerTimeout
@@ -343,6 +359,13 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 			h.writeTerminalError(w, route, 502, "Upstream request failed", err.Error())
 		}
 		return 0, false
+	}
+
+	// Got the response headers (first byte). Stop the first-byte timer so the
+	// request context stays alive for the full streaming read. The body now
+	// lives as long as the client's request context (r.Context()).
+	if firstByteTimer != nil {
+		firstByteTimer.Stop()
 	}
 
 	// Status-based failover (non-streaming only).
