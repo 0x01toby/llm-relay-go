@@ -744,14 +744,21 @@ var _ = context.Background
 // query param (1h, 24h, 7d, 30d). Returns the shape expected by the React
 // dashboard's useUsageStats hook.
 func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
-	createdAfter := parseRangeMs(r.URL.Query().Get("range"))
+	q := r.URL.Query()
+	f := rollupFilter{
+		CreatedAfter: parseRangeMs(q.Get("range")),
+		Route:        q.Get("route"),
+		Model:        q.Get("model"),
+		Client:       q.Get("client"),
+	}
 	ctx := r.Context()
 
 	// All stats read from the pre-aggregated request_stats_5m rollup table
 	// (populated by the background scheduler), so they stay accurate even after
 	// old console_requests rows are pruned. Cost columns are pre-priced at
-	// rollup time, so no per-row pricing pass is needed here.
-	overview, err := computeOverviewFromRollup(ctx, a.gdb, createdAfter)
+	// rollup time, so no per-row pricing pass is needed here. The route/model/
+	// client filters narrow every query (overview, buckets, timeseries).
+	overview, err := computeOverviewFromRollup(ctx, a.gdb, f)
 	if err != nil {
 		log.Printf("[console] stats overview: %v", err)
 		writeJSON(w, http.StatusInternalServerError, obj{"error": "failed to compute stats"})
@@ -768,17 +775,20 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		cacheMisses = 0
 	}
 
-	routeBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "route_prefix", createdAfter)
-	modelBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "request_model", createdAfter)
-	clientBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "api_key_name", createdAfter)
+	// Each bucket table groups by its own dimension; the other two filter
+	// dimensions still apply. E.g. grouping by route while filtering model=X
+	// shows per-route breakdown of that model's usage.
+	routeBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "route_prefix", f)
+	modelBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "request_model", f)
+	clientBuckets, _ := computeBucketsFromRollup(ctx, a.gdb, "api_key_name", f)
 
 	routeObj := rollupBucketsToObj(routeBuckets)
 	modelObj := rollupBucketsToObj(modelBuckets)
 	clientObj := rollupBucketsToObj(clientBuckets)
-	ts := computeTimeseriesFromRollup(ctx, a.gdb, createdAfter)
+	ts := computeTimeseriesFromRollup(ctx, a.gdb, f)
 
 	// Latency averages from pre-aggregated sums.
-	var avgFirstChunk, avgFirstToken, avgDuration *float64
+	var avgFirstChunk, avgFirstToken, avgDuration, avgGeneration *float64
 	if overview.CountTimed > 0 {
 		d := float64(overview.SumDurationMs) / float64(overview.CountTimed)
 		avgDuration = &d
@@ -787,6 +797,9 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		ft := float64(overview.SumFirstTokenMs) / float64(overview.CountTimed)
 		avgFirstToken = &ft
 		avgFirstChunk = &ft // same column in rollup; distinct on the request row
+		// generation = pure output time (completed - first_token).
+		g := float64(overview.SumGenerationMs) / float64(overview.CountTimed)
+		avgGeneration = &g
 	}
 	totalCost := overview.InputCost + overview.OutputCost + overview.CacheReadCost + overview.CacheWriteCost
 
@@ -814,7 +827,7 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 			"avg_first_chunk_ms":             avgFirstChunk,
 			"avg_first_token_ms":             avgFirstToken,
 			"avg_duration_ms":                avgDuration,
-			"avg_generation_ms":              nil,
+			"avg_generation_ms":              avgGeneration,
 			"storage_backend":                a.dialect.String(),
 			"retention_max_records":          a.maxRecords,
 		},

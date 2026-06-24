@@ -46,23 +46,26 @@ func NewRollup(gdb *gorm.DB, cat priceLooker) *Rollup {
 }
 
 // rollupRow is a lightweight projection of one console_requests row, just the
-// columns the rollup needs (no payloads/headers).
+// columns the rollup needs (no payloads/headers). The gorm column tags are
+// essential: the field names don't match the DB column names, so without them
+// GORM's Scan would map cache_read_tokens (field snake) and miss
+// cache_read_input_tokens (the actual column), silently reading 0.
 type rollupRow struct {
-	CreatedAt           int64
-	RoutePrefix         string
-	RequestModel        string
-	ResponseModel       *string
-	APIKeyName          *string
-	ResponseStatus      *int
-	FailoverFrom        *string
-	CacheReadTokens     int64
-	CacheCreateTokens   int64
-	InputTokens         int64
-	OutputTokens        int64
-	CachedInputTokens   int64
-	ReasoningTokens     int64
-	CompletedAt         *int64
-	FirstTokenAt        *int64
+	CreatedAt         int64
+	RoutePrefix       string
+	RequestModel      string
+	ResponseModel     *string
+	APIKeyName        *string
+	ResponseStatus    *int
+	FailoverFrom      *string
+	CacheReadTokens   int64 `gorm:"column:cache_read_input_tokens"`
+	CacheCreateTokens int64 `gorm:"column:cache_creation_input_tokens"`
+	InputTokens       int64
+	OutputTokens      int64
+	CachedInputTokens int64 `gorm:"column:cached_input_tokens"`
+	ReasoningTokens   int64 `gorm:"column:reasoning_output_tokens"`
+	CompletedAt       *int64
+	FirstTokenAt      *int64
 }
 
 // aggregate is the in-memory accumulator for one (bucket, route, model, client) key.
@@ -84,6 +87,7 @@ type aggregate struct {
 	CacheWriteCost      float64
 	SumDurationMs       int64
 	SumFirstTokenMs     int64
+	SumGenerationMs     int64
 	CountTimed          int64
 	MaxRequestCreatedAt int64
 }
@@ -204,6 +208,10 @@ func (r *Rollup) fold(ag *aggregate, row *rollupRow) {
 	if row.FirstTokenAt != nil {
 		ag.SumFirstTokenMs += *row.FirstTokenAt - row.CreatedAt
 	}
+	// Generation = completed - first_token (pure output time, excludes TTFT).
+	if row.FirstTokenAt != nil && row.CompletedAt != nil {
+		ag.SumGenerationMs += *row.CompletedAt - *row.FirstTokenAt
+	}
 
 	if row.CreatedAt > ag.MaxRequestCreatedAt {
 		ag.MaxRequestCreatedAt = row.CreatedAt
@@ -241,6 +249,7 @@ func (r *Rollup) persist(ctx context.Context, aggs map[bucketKey]*aggregate) err
 				CacheWriteCostUSD:   ag.CacheWriteCost,
 				SumDurationMs:       ag.SumDurationMs,
 				SumFirstTokenMs:     ag.SumFirstTokenMs,
+				SumGenerationMs:     ag.SumGenerationMs,
 				CountTimed:          ag.CountTimed,
 				MaxRequestCreatedAt: ag.MaxRequestCreatedAt,
 				CreatedAt:           now,
@@ -265,9 +274,9 @@ func upsertAggregate(tx *gorm.DB, row *schema.RequestStats5m) error {
 		input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
 		cached_input_tokens, reasoning_tokens,
 		input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_write_cost_usd,
-		sum_duration_ms, sum_first_token_ms, count_timed,
+		sum_duration_ms, sum_first_token_ms, sum_generation_ms, count_timed,
 		max_request_created_at, created_at
-	) VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?)
+	) VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?)
 	ON CONFLICT(bucket_start, route_prefix, request_model, api_key_name) DO UPDATE SET
 		requests = request_stats_5m.requests + excluded.requests,
 		errors = request_stats_5m.errors + excluded.errors,
@@ -286,6 +295,7 @@ func upsertAggregate(tx *gorm.DB, row *schema.RequestStats5m) error {
 		cache_write_cost_usd = request_stats_5m.cache_write_cost_usd + excluded.cache_write_cost_usd,
 		sum_duration_ms = request_stats_5m.sum_duration_ms + excluded.sum_duration_ms,
 		sum_first_token_ms = request_stats_5m.sum_first_token_ms + excluded.sum_first_token_ms,
+		sum_generation_ms = request_stats_5m.sum_generation_ms + excluded.sum_generation_ms,
 		count_timed = request_stats_5m.count_timed + excluded.count_timed,
 		max_request_created_at = MAX(request_stats_5m.max_request_created_at, excluded.max_request_created_at),
 		created_at = excluded.created_at`,
@@ -294,7 +304,7 @@ func upsertAggregate(tx *gorm.DB, row *schema.RequestStats5m) error {
 		row.InputTokens, row.OutputTokens, row.CacheReadTokens, row.CacheCreateTokens,
 		row.CachedInputTokens, row.ReasoningTokens,
 		row.InputCostUSD, row.OutputCostUSD, row.CacheReadCostUSD, row.CacheWriteCostUSD,
-		row.SumDurationMs, row.SumFirstTokenMs, row.CountTimed,
+		row.SumDurationMs, row.SumFirstTokenMs, row.SumGenerationMs, row.CountTimed,
 		row.MaxRequestCreatedAt, row.CreatedAt,
 	).Error
 }
