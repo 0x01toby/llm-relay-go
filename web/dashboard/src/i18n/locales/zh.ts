@@ -272,6 +272,8 @@ export default {
     cacheMiss: "未命中 (Miss)",
     cacheBypass: "绕过 (Bypass)",
     cacheError: "缓存错误 (Error)",
+    prevPage: "上一页",
+    nextPage: "下一页",
   },
 
   // ── Request Log Table ──

@@ -11,6 +11,7 @@
 /bin/
 /dist/
 *.exe
+llm-relay
 # Vendored deps are not committed; Dockerfile uses `go mod download`.
 /vendor/
 
