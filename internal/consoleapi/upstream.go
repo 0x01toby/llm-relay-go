@@ -243,7 +243,7 @@ func buildProbeRequest(target upstreamTarget, model string) (*http.Request, erro
 			"model":       model,
 			"max_tokens":  1,
 			"messages":    []map[string]string{{"role": "user", "content": "ping"}},
-			"stream":      false,
+			"stream":      true,
 		}
 		body, _ = json.Marshal(payload)
 	}

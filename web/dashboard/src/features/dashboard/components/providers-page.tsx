@@ -6,11 +6,9 @@ import {
   EyeOff,
   Globe,
   Import,
-  Search,
   Plus,
   RefreshCw,
   Server,
-  SlidersHorizontal,
   SquarePen,
   Trash2,
   Upload,
@@ -301,9 +299,6 @@ export function ProvidersPage({
   const [providers, setProviders] = useState<ProviderInfo[] | null>(null)
   const [error, setError] = useState("")
   const { t } = useTranslation()
-  const [searchQuery, setSearchQuery] = useState("")
-  const [typeFilter, setTypeFilter] = useState("all")
-  const [statusFilter, setStatusFilter] = useState("all")
   const [dialogOpen, setDialogOpen] = useState(false)
   const [dialogMode, setDialogMode] = useState<DialogMode>("create")
   const [activeProvider, setActiveProvider] = useState<ProviderInfo | null>(null)
@@ -422,27 +417,7 @@ export function ProvidersPage({
     }
   }, [providers])
 
-  const displayedProviders = useMemo(() => {
-    const list = providers ?? []
-    const query = searchQuery.trim().toLowerCase()
-
-    return list.filter((provider) => {
-      const matchesSearch = !query || [
-        provider.channelName,
-        provider.targetBaseUrl,
-        provider.type,
-        provider.routingVisibility,
-        provider.models.map((model) => model.model).join(" "),
-      ].some((value) => value.toLowerCase().includes(query))
-      const matchesType = typeFilter === "all" || provider.type === typeFilter
-      const matchesStatus =
-        statusFilter === "all" ||
-        (statusFilter === "enabled" && provider.enabled) ||
-        (statusFilter === "disabled" && !provider.enabled)
-
-      return matchesSearch && matchesType && matchesStatus
-    })
-  }, [providers, searchQuery, statusFilter, typeFilter])
+  const displayedProviders = useMemo(() => providers ?? [], [providers])
 
   function openCreateDialog() {
     setDialogMode("create")
@@ -773,50 +748,6 @@ export function ProvidersPage({
             </CardContent>
           </Card>
         </div>
-
-        <Card>
-          <CardContent className="pt-6">
-            <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-              <SlidersHorizontal className="h-4 w-4 text-muted-foreground" />
-              渠道筛选
-            </div>
-            <div className="grid gap-3 lg:grid-cols-[minmax(18rem,1fr)_12rem_12rem]">
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="搜索渠道、URL、模型..."
-                  className="bg-white/70 pl-9"
-                />
-              </div>
-              <Select value={typeFilter} onValueChange={setTypeFilter}>
-                <SelectTrigger className="bg-white/70">
-                  <SelectValue placeholder="Type" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="all">全部类型</SelectItem>
-                    <SelectItem value="openai">OpenAI</SelectItem>
-                    <SelectItem value="anthropic">Anthropic</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              <Select value={statusFilter} onValueChange={setStatusFilter}>
-                <SelectTrigger className="bg-white/70">
-                  <SelectValue placeholder="Status" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="all">全部状态</SelectItem>
-                    <SelectItem value="enabled">{t("common.enabled")}</SelectItem>
-                    <SelectItem value="disabled">{t("common.disabled")}</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </div>
-          </CardContent>
-        </Card>
 
         {providers.length === 0 ? (
           <Empty className="border">

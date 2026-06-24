@@ -190,6 +190,7 @@ type RequestStats5m struct {
 	// Latency aggregates (so avg cards have data without a separate scan).
 	SumDurationMs     int64 `gorm:"column:sum_duration_ms"`
 	SumFirstTokenMs   int64 `gorm:"column:sum_first_token_ms"`
+	SumGenerationMs   int64 `gorm:"column:sum_generation_ms"`
 	CountTimed        int64 `gorm:"column:count_timed"`
 	// Cursor: the largest console_requests.created_at folded into this row. The
 	// rollup job advances its watermark to MAX(max_request_created_at) so it only
