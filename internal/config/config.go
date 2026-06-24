@@ -24,7 +24,7 @@ const (
 	DefaultResponseIdleTimeoutMs     = 300_000
 
 	DefaultPort              = 3300
-	DefaultDebugDBMaxRecords = 50_000
+	DefaultDebugDBMaxRecords = 2_000
 	MinDebugDBMaxRecords     = 200
 
 	// Logging limits mirror logging-constants.ts.

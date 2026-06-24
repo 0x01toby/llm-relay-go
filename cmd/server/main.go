@@ -12,7 +12,9 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/taozhang/llmrelay/internal/catalog"
 	"github.com/taozhang/llmrelay/internal/config"
 	"github.com/taozhang/llmrelay/internal/configstore"
 	"github.com/taozhang/llmrelay/internal/consoleapi"
@@ -23,6 +25,7 @@ import (
 	"github.com/taozhang/llmrelay/internal/logtasks"
 	"github.com/taozhang/llmrelay/internal/migrate"
 	"github.com/taozhang/llmrelay/internal/server"
+	"github.com/taozhang/llmrelay/internal/statsstore"
 	"github.com/taozhang/llmrelay/internal/web"
 )
 
@@ -60,9 +63,39 @@ func main() {
 	var consoleHandler http.Handler
 	var rootHandler http.HandlerFunc
 	lt := logtasks.New()
+	// Background scheduler runs periodic housekeeping (currently: console log
+	// retention pruning). It is independent of the request path and shuts down
+	// cleanly via the server's drain.
+	sched := server.NewBackgroundScheduler()
 	if gdb != nil {
 		store := configstore.NewStoreForDB(gdb)
 		reqRepo := consolestore.New(gdb, cfg.DebugDBMaxRecords)
+
+		// Catalog (models.dev pricing/context) is held purely in memory. The
+		// pricing data is //go:embed'd from internal/catalog/models-dev.json,
+		// which is kept up to date via scripts/sync-prices.sh (committed to git).
+		// At boot it is parsed into memory with zero DB/network dependency, and
+		// lookups never touch the DB or the network. Update prices by running
+		// the sync script and redeploying.
+		cat := catalog.New()
+		if err := cat.WarmFromEmbed(); err != nil {
+			log.Printf("[catalog] warm from vendored catalog: %v", err)
+		}
+
+		// Prune old request-log rows every 10 minutes so the table stays within
+		// the retention cap. Runs out-of-band from SaveRequest.
+		sched.Add("console-cleanup", 10*time.Minute, func(ctx context.Context) error {
+			return reqRepo.Cleanup(ctx)
+		})
+
+		// Fold new request-log rows into the 5-minute stats rollup table every
+		// 3 minutes, so Usage/Monitor stats stay accurate even after old rows
+		// are pruned by the retention cap.
+		rollup := statsstore.NewRollup(gdb, cat)
+		sched.Add("stats-rollup", 3*time.Minute, func(ctx context.Context) error {
+			return rollup.RollupTick(ctx)
+		})
+
 		gwTimeouts := gateway.TimeoutSettings{
 			DefaultFirstByteMs: cfg.Timeouts.DefaultFirstByteMs,
 			StreamFirstByteMs:  cfg.Timeouts.StreamFirstByteMs,
@@ -72,7 +105,7 @@ func main() {
 		gw := gateway.NewHandler(gdb, store, cfg.GatewayAPIKey, gwTimeouts, reqRepo, lt)
 		proxy = gw
 		modelsHandler = gw.ModelListHandler("")
-		consoleHandler = consoleapi.New(gdb, dialect, store, cfg.GatewayAPIKey, cfg.DebugDBMaxRecords).Routes()
+		consoleHandler = consoleapi.New(gdb, dialect, store, cat, cfg.GatewayAPIKey, cfg.DebugDBMaxRecords).Routes()
 		// The root handler serves the SPA for browser navigation, but defers to
 		// the proxy for API/model paths (handled inside web.Handler).
 		webHandler := web.Handler()
@@ -119,13 +152,16 @@ func main() {
 	})
 
 	// Register the background-log drain: wait for in-flight request/response
-	// log writes to flush before exiting (fixes the original service's defect).
+	// log writes to flush before exiting (fixes the original service's defect),
+	// then stop the periodic background scheduler.
+	sched.Start()
 	srv.WithDrain(func(ctx context.Context) error {
 		if err := lt.Wait(ctx); err != nil {
 			log.Printf("log drain incomplete: %v", err)
 		} else {
 			log.Printf("log drain complete")
 		}
+		_ = sched.Stop(ctx)
 		return nil
 	})
 
