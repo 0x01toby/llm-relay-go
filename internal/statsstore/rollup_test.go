@@ -36,6 +36,12 @@ func setupTestDB(t *testing.T) *gorm.DB {
 
 func insertRequest(t *testing.T, gdb *gorm.DB, r schema.ConsoleRequest) {
 	t.Helper()
+	// Rollup only processes rows with completed_at set (response data is written
+	// asynchronously), so default it if the caller didn't.
+	if r.CompletedAt == nil {
+		c := r.CreatedAt + 5000
+		r.CompletedAt = &c
+	}
 	if err := gdb.Create(&r).Error; err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -67,14 +73,16 @@ func TestRollupTick_Incremental(t *testing.T) {
 	rollup := NewRollup(gdb, cat)
 
 	// Bucket base: 1000000 (a 5m boundary). Two requests in the first batch.
+	// completed_at must be monotonic since the rollup cursor tracks it.
 	insertRequest(t, gdb, schema.ConsoleRequest{
 		RequestID: "r1", CreatedAt: 1000000, RoutePrefix: "openai",
 		RequestModel: "gpt-4o", ResponseModel: strPtr("gpt-4o"),
-		InputTokens: 1000, OutputTokens: 500, CompletedAt: int64Ptr(1050000),
+		InputTokens: 1000, OutputTokens: 500, CompletedAt: int64Ptr(1001000),
 	})
 	insertRequest(t, gdb, schema.ConsoleRequest{
 		RequestID: "r2", CreatedAt: 1001000, RoutePrefix: "openai",
 		RequestModel: "gpt-4o", InputTokens: 2000, OutputTokens: 300,
+		CompletedAt: int64Ptr(1002000),
 	})
 
 	mustTick(t, rollup)
@@ -101,6 +109,7 @@ func TestRollupTick_Incremental(t *testing.T) {
 	insertRequest(t, gdb, schema.ConsoleRequest{
 		RequestID: "r3", CreatedAt: 1002000, RoutePrefix: "openai",
 		RequestModel: "gpt-4o", InputTokens: 4000, OutputTokens: 100,
+		CompletedAt: int64Ptr(1003000),
 	})
 	mustTick(t, rollup)
 	rows = allRows(t, gdb)

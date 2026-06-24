@@ -102,7 +102,7 @@ func main() {
 			ImageFirstByteMs:   cfg.Timeouts.ImageFirstByteMs,
 			ResponseIdleMs:     cfg.Timeouts.ResponseIdleMs,
 		}
-		gw := gateway.NewHandler(gdb, store, cfg.GatewayAPIKey, gwTimeouts, reqRepo, lt)
+		gw := gateway.NewHandler(gdb, store, cfg.GatewayAPIKey, gwTimeouts, reqRepo, lt, cat)
 		proxy = gw
 		modelsHandler = gw.ModelListHandler("")
 		consoleHandler = consoleapi.New(gdb, dialect, store, cat, cfg.GatewayAPIKey, cfg.DebugDBMaxRecords).Routes()
@@ -147,8 +147,9 @@ func main() {
 	})
 
 	srv := server.New(server.ServerConfig{
-		Addr:    cfg.Addr(),
-		Handler: fullHandler,
+		Addr:              cfg.Addr(),
+		Handler:           fullHandler,
+		ReadHeaderTimeout: 10 * time.Second,
 	})
 
 	// Register the background-log drain: wait for in-flight request/response

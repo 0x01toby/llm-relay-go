@@ -54,9 +54,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request, cfg SpikeConfig) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	const maxBodyBytes = 20 * 1024 * 1024 // 20 MiB
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxBodyBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 

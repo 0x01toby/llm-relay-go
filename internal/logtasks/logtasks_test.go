@@ -100,3 +100,26 @@ func TestWait_RespectsContextCancel(t *testing.T) {
 		t.Error("Wait should return ctx.Err() on timeout")
 	}
 }
+
+// TestTrackRequestWrite_CleansUpMap verifies the last map doesn't leak entries
+// after tasks complete (the fix for the unbounded memory growth bug).
+func TestTrackRequestWrite_CleansUpMap(t *testing.T) {
+	c := New()
+
+	// Run many sequential writes for the same key; each should clean up its
+	// predecessor's entry.
+	for i := 0; i < 100; i++ {
+		<-c.TrackRequestWrite("req-leak", func() {})
+	}
+	// Also run writes for different keys.
+	for i := 0; i < 50; i++ {
+		<-c.TrackRequestWrite("req-diff", func() {})
+	}
+
+	c.mu.Lock()
+	leaked := len(c.last)
+	c.mu.Unlock()
+	if leaked != 0 {
+		t.Errorf("last map leaked %d entries after completion, want 0", leaked)
+	}
+}

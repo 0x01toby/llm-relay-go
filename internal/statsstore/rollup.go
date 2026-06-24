@@ -100,20 +100,25 @@ type bucketKey struct {
 	Client       string
 }
 
-// RollupTick advances the rollup cursor: reads console_requests rows newer than
-// the last processed created_at, aggregates them into 5-minute buckets, and
-// upserts them into request_stats_5m. Idempotent — re-running with no new rows
-// is a no-op.
+// RollupTick advances the rollup cursor: reads completed console_requests rows
+// (completed_at IS NOT NULL) newer than the last processed completed_at,
+// aggregates them into 5-minute buckets, and upserts them into request_stats_5m.
+// Only completed rows are processed because response data (tokens, status,
+// timing) is written asynchronously by SaveResponse — if we rolled up by
+// created_at we'd see rows with zero/nil response fields and never revisit them.
+// Idempotent — re-running with no new rows is a no-op.
 func (r *Rollup) RollupTick(ctx context.Context) error {
 	// Derive the cursor: the largest max_request_created_at already rolled up.
+	// (Despite the column name, it tracks completed_at since that's what we
+	// filter on — renamed would break the schema, so the name is historical.)
 	var cursor int64
 	if err := r.db.WithContext(ctx).Model(&schema.RequestStats5m{}).
 		Select("COALESCE(MAX(max_request_created_at), 0)").Row().Scan(&cursor); err != nil {
 		return err
 	}
 
-	// Pull new rows since the cursor. Cap at a batch so a huge backlog after a
-	// restart degrades gracefully instead of one giant transaction.
+	// Pull completed rows whose completed_at is past the cursor. Cap at a batch
+	// so a huge backlog after a restart degrades gracefully.
 	var rows []rollupRow
 	if err := r.db.WithContext(ctx).Model(&schema.ConsoleRequest{}).
 		Select("created_at", "route_prefix", "request_model", "response_model",
@@ -121,8 +126,8 @@ func (r *Rollup) RollupTick(ctx context.Context) error {
 			"cache_read_input_tokens", "cache_creation_input_tokens",
 			"input_tokens", "output_tokens", "cached_input_tokens",
 			"reasoning_output_tokens", "completed_at", "first_token_at").
-		Where("created_at > ?", cursor).
-		Order("created_at ASC").
+		Where("completed_at IS NOT NULL AND completed_at > ?", cursor).
+		Order("completed_at ASC").
 		Limit(5000).
 		Scan(&rows).Error; err != nil {
 		return err
@@ -213,8 +218,10 @@ func (r *Rollup) fold(ag *aggregate, row *rollupRow) {
 		ag.SumGenerationMs += *row.CompletedAt - *row.FirstTokenAt
 	}
 
-	if row.CreatedAt > ag.MaxRequestCreatedAt {
-		ag.MaxRequestCreatedAt = row.CreatedAt
+	// Track the max completed_at for the rollup cursor (we filter on
+	// completed_at, not created_at, to avoid the SaveRequest/SaveResponse race).
+	if row.CompletedAt != nil && *row.CompletedAt > ag.MaxRequestCreatedAt {
+		ag.MaxRequestCreatedAt = *row.CompletedAt
 	}
 }
 

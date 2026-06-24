@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/taozhang/llmrelay/internal/configstore"
@@ -135,18 +136,12 @@ func (r *Resolver) sortedProviders() []modelMatch {
 
 func sortByPriority(ms []modelMatch) {
 	// Stable sort by priority desc, then channel asc (matches the TS sort).
-	for i := 1; i < len(ms); i++ {
-		for j := i; j > 0; j-- {
-			a, b := ms[j-1], ms[j]
-			if a.entry.Priority > b.entry.Priority {
-				break
-			}
-			if a.entry.Priority == b.entry.Priority && a.channel <= b.channel {
-				break
-			}
-			ms[j-1], ms[j] = b, a
+	sort.SliceStable(ms, func(i, j int) bool {
+		if ms[i].entry.Priority != ms[j].entry.Priority {
+			return ms[i].entry.Priority > ms[j].entry.Priority
 		}
-	}
+		return ms[i].channel < ms[j].channel
+	})
 }
 
 // --- Listing (for /v1/models and the console) ---
