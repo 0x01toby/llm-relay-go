@@ -272,6 +272,8 @@ export default {
     cacheMiss: "Miss",
     cacheBypass: "Bypass",
     cacheError: "Cache Error",
+    prevPage: "Prev",
+    nextPage: "Next",
   },
 
   // ── Request Log Table ──

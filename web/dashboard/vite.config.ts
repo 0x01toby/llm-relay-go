@@ -8,7 +8,9 @@ export default defineConfig({
   base: "/",
   plugins: [react(), tailwindcss()],
   build: {
-    outDir: path.resolve(__dirname, "../../dist/frontend"),
+    // Build directly into the Go //go:embed root (internal/web/dist) so the
+    // single binary picks up the freshly built assets with no copy step.
+    outDir: path.resolve(__dirname, "../../internal/web/dist"),
     assetsDir: "dashboard-assets",
     emptyOutDir: true,
   },

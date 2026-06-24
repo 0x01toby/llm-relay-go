@@ -9,8 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
-	"time"
 
 	"gorm.io/gorm"
 
@@ -20,16 +20,15 @@ import (
 
 // Repository owns the console_requests table.
 type Repository struct {
-	db          *gorm.DB
-	maxRecords  int   // retention cap (DEBUG_DB_MAX_RECORDS)
-	lastCleanup int64 // throttles cleanup to once per minute
+	db         *gorm.DB
+	maxRecords int // retention cap (DEBUG_DB_MAX_RECORDS)
 }
 
 // New builds a Repository against gdb. maxRecords caps how many rows are
 // retained (oldest pruned periodically).
 func New(gdb *gorm.DB, maxRecords int) *Repository {
 	if maxRecords < 200 {
-		maxRecords = 50000
+		maxRecords = 2000
 	}
 	return &Repository{db: gdb, maxRecords: maxRecords}
 }
@@ -156,7 +155,7 @@ func (r *Repository) SaveRequest(ctx context.Context, s RequestSnapshot) error {
 			return fmt.Errorf("save request: %w", res.Error)
 		}
 	}
-	return r.maybeCleanup(ctx)
+	return nil
 }
 
 // SaveResponse updates a request row with the response data. The row must
@@ -192,21 +191,6 @@ func (r *Repository) SaveResponse(ctx context.Context, s ResponseSnapshot) error
 		}).Error
 }
 
-// RequestListItem is one row in the console request list.
-type RequestListItem struct {
-	RequestID    string                 `json:"request_id"`
-	CreatedAt    int64                  `json:"created_at"`
-	RoutePrefix  string                 `json:"route_prefix"`
-	UpstreamType string                 `json:"upstream_type"`
-	Method       string                 `json:"method"`
-	Path         string                 `json:"path"`
-	TargetURL    string                 `json:"target_url"`
-	RequestModel string                 `json:"request_model"`
-	APIKeyName   *string                `json:"api_key_name"`
-	Status       *int                   `json:"response_status"`
-	Usage        map[string]interface{} `json:"usage,omitempty"`
-}
-
 // ListFilter controls list pagination and filtering.
 type ListFilter struct {
 	Limit  int
@@ -215,15 +199,27 @@ type ListFilter struct {
 	Model  string
 	Status string // "success" | "error"
 	Search string
+	// SortBy selects the sort column: "created_at" (default), "response_status",
+	// or "tokens". SortOrder is "asc" or "desc" (default "desc").
+	SortBy    string
+	SortOrder string
 }
 
-// List returns a paginated request list plus the total count.
-func (r *Repository) List(ctx context.Context, f ListFilter) ([]RequestListItem, int, error) {
+// List returns a paginated set of request rows plus the total count. It returns
+// the raw schema rows so callers (the console API) can assemble the nested
+// response_timing/response_usage shape the dashboard expects. Sort order is
+// controlled by sortBy/sortOrder (defaults: created_at DESC).
+//
+// To avoid hauling multi-hundred-KB payload blobs on every page load, the list
+// selects only the "summary" columns the dashboard table renders. The heavy
+// payload/header blobs (original_payload, forwarded_payload, response_payload,
+// *_headers_json) are fetched on demand by Get() when a detail view is opened.
+func (r *Repository) List(ctx context.Context, f ListFilter) ([]schema.ConsoleRequest, int, error) {
 	if f.Limit <= 0 {
 		f.Limit = 50
 	}
-	if f.Limit > 200 {
-		f.Limit = 200
+	if f.Limit > 1000 {
+		f.Limit = 1000
 	}
 	if f.Offset < 0 {
 		f.Offset = 0
@@ -238,32 +234,53 @@ func (r *Repository) List(ctx context.Context, f ListFilter) ([]RequestListItem,
 	}
 
 	var rows []schema.ConsoleRequest
-	if err := q.Order("created_at DESC").Limit(f.Limit).Offset(f.Offset).Find(&rows).Error; err != nil {
+	if err := q.Select(listColumns).
+		Order(orderClause(f)).Limit(f.Limit).Offset(f.Offset).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
+	return rows, int(total), nil
+}
 
-	out := make([]RequestListItem, 0, len(rows))
-	for _, row := range rows {
-		item := RequestListItem{
-			RequestID:    row.RequestID,
-			CreatedAt:    row.CreatedAt,
-			RoutePrefix:  row.RoutePrefix,
-			UpstreamType: row.UpstreamType,
-			Method:       row.Method,
-			Path:         row.Path,
-			TargetURL:    row.TargetURL,
-			RequestModel: row.RequestModel,
-			APIKeyName:   row.APIKeyName,
-			Status:       row.ResponseStatus,
-		}
-		if row.InputTokens > 0 || row.OutputTokens > 0 {
-			item.Usage = map[string]interface{}{
-				"input_tokens": row.InputTokens, "output_tokens": row.OutputTokens, "total_tokens": row.TotalTokens,
-			}
-		}
-		out = append(out, item)
+// listColumns is the projection used by List: every column except the heavy
+// payload/header TEXT blobs. Keeping this explicit (rather than SELECT *) means
+// a 50-row page load skips ~9MB of forwarded/response payloads that the table
+// view never renders. Column names mirror the DB column tags on ConsoleRequest.
+var listColumns = []string{
+	"request_id", "created_at", "route_prefix", "upstream_type",
+	"method", "path", "target_url", "request_model",
+	"api_key_id", "api_key_name",
+	// truncation flags + reason are lightweight and shown as badges.
+	"original_payload_truncated", "forwarded_payload_truncated",
+	"response_payload_truncated", "response_payload_truncation_reason",
+	// summaries (small JSON) are rendered in the list's forwarded_summary.
+	"forwarded_summary_json",
+	"response_status", "response_status_text",
+	"response_body_bytes", "first_chunk_at", "first_token_at", "completed_at",
+	"has_streaming_content", "response_model", "stop_reason",
+	"input_tokens", "output_tokens", "total_tokens",
+	"cache_creation_input_tokens", "cache_read_input_tokens", "cached_input_tokens",
+	"reasoning_output_tokens", "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens",
+	"failover_from", "failover_chain_json", "original_route_prefix",
+	"original_request_model", "failover_reason", "retry_attempt",
+	"source_request_type", "token_usage_estimated", "quota_charged_microusd",
+}
+
+// orderClause maps the list filter's sort key/direction to a SQL ORDER BY
+// clause. sortBy is constrained to a safe allowlist (never user input injected
+// verbatim). tokens sort uses (input_tokens + output_tokens).
+func orderClause(f ListFilter) string {
+	dir := "DESC"
+	if strings.EqualFold(f.SortOrder, "asc") {
+		dir = "ASC"
 	}
-	return out, int(total), nil
+	switch f.SortBy {
+	case "response_status":
+		return "response_status " + dir + ", created_at DESC"
+	case "tokens":
+		return "(input_tokens + output_tokens) " + dir + ", created_at DESC"
+	default: // "created_at" or anything unknown
+		return "created_at " + dir
+	}
 }
 
 // applyFilters adds the route/model/status/search filters to the query. Uses
@@ -291,21 +308,45 @@ func applyFilters(q *gorm.DB, f ListFilter) *gorm.DB {
 	return q
 }
 
-// maybeCleanup prunes old rows beyond the retention cap, at most once per 60s.
-func (r *Repository) maybeCleanup(ctx context.Context) error {
-	now := time.Now().UnixMilli()
-	if now-r.lastCleanup < 60_000 {
-		return nil
+// Cleanup prunes old rows beyond the retention cap. It first counts (cheap,
+// via the created_at index); only when the cap is exceeded does it delete. The
+// delete uses a created_at threshold derived from the Nth-newest row so it can
+// lean on the created_at index instead of a correlated NOT-IN subquery.
+//
+// Cleanup is invoked by a periodic background scheduler (see internal/server),
+// not on every SaveRequest, so the request write path stays free of retention
+// work. The context lets a graceful shutdown abort a long delete promptly.
+func (r *Repository) Cleanup(ctx context.Context) error {
+	var total int64
+	if err := r.db.WithContext(ctx).Model(&schema.ConsoleRequest{}).Count(&total).Error; err != nil {
+		return err
 	}
-	r.lastCleanup = now
-	// Delete all but the most recent N rows. Uses a NOT IN subquery against the
-	// same table — portable across all three dialects.
-	return r.db.WithContext(ctx).Where("request_id NOT IN (?)",
-		r.db.WithContext(ctx).Model(&schema.ConsoleRequest{}).
-			Select("request_id").
-			Order("created_at DESC").
-			Limit(r.maxRecords),
-	).Delete(&schema.ConsoleRequest{}).Error
+	if total <= int64(r.maxRecords) {
+		return nil // nothing to prune
+	}
+
+	// Find the created_at of the Nth-newest row (the cutoff). Rows older than it
+	// are excess and get deleted. The subquery walks the created_at index.
+	var cutoff int64
+	if err := r.db.WithContext(ctx).Model(&schema.ConsoleRequest{}).
+		Select("created_at").
+		Order("created_at DESC").
+		Offset(r.maxRecords).
+		Limit(1).
+		Row().Scan(&cutoff); err != nil {
+		return err
+	}
+	// Delete strictly-older rows (>= cutoff kept, to avoid over-deleting ties).
+	res := r.db.WithContext(ctx).
+		Where("created_at < ?", cutoff).
+		Delete(&schema.ConsoleRequest{})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("[console] cleanup pruned %d row(s) beyond cap %d", res.RowsAffected, r.maxRecords)
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {

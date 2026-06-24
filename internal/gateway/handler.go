@@ -359,7 +359,7 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 	}
 
 	// Stream the response to the client, capturing it for observation.
-	h.streamResponse(w, r, resp, route, forwardBody, requestedModel, apiKey)
+	h.streamResponse(w, r, resp, route, forwardBody, rawBody, requestedModel, apiKey)
 	resp.Body.Close()
 	return resp.StatusCode, false
 }
@@ -372,13 +372,14 @@ type requestLogMeta struct {
 	method       string
 	path         string
 	requestModel string
-	forwardBody  []byte
+	originalBody []byte // the inbound request body as received (pre-conversion)
+	forwardBody  []byte // the body actually sent upstream (may differ after conversion/model rewrite)
 	apiKey       *AuthenticatedAPIKey
 }
 
 // streamResponse copies the upstream response to the client (flushing for SSE)
 // while a background observer captures the body for the console log.
-func (h *Handler) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, route *routing.RouteResult, forwardBody []byte, requestModel string, apiKey *AuthenticatedAPIKey) {
+func (h *Handler) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, route *routing.RouteResult, forwardBody []byte, rawBody []byte, requestModel string, apiKey *AuthenticatedAPIKey) {
 	cors.Apply(w.Header(), r)
 	// Copy headers (minus hop-by-hop).
 	for k, vs := range resp.Header {
@@ -404,11 +405,11 @@ func (h *Handler) streamResponse(w http.ResponseWriter, r *http.Request, resp *h
 	meta := requestLogMeta{
 		requestID: requestID, createdAt: createdAt, route: route,
 		method: r.Method, path: r.URL.Path, requestModel: requestModel,
-		forwardBody: forwardBody, apiKey: apiKey,
+		originalBody: rawBody, forwardBody: forwardBody, apiKey: apiKey,
 	}
 
 	// Persist the request snapshot asynchronously (the INSERT).
-	h.recordRequest(meta, r, forwardBody)
+	h.recordRequest(meta, r, forwardBody, rawBody)
 
 	// Tee-split the response body: client gets ClientBody(), observer gets a copy.
 	var clientBody io.Reader = resp.Body
@@ -441,13 +442,15 @@ func (h *Handler) streamResponse(w http.ResponseWriter, r *http.Request, resp *h
 }
 
 // recordRequest asynchronously inserts the request snapshot into console_requests.
-func (h *Handler) recordRequest(meta requestLogMeta, r *http.Request, forwardBody []byte) {
+func (h *Handler) recordRequest(meta requestLogMeta, r *http.Request, forwardBody []byte, rawBody []byte) {
 	if h.requests == nil || h.logtasks == nil {
 		return
 	}
 	fwdPayload := string(forwardBody)
+	fwdTruncated := false
 	if len(fwdPayload) > consolestorePayloadLimit {
 		fwdPayload = fwdPayload[:consolestorePayloadLimit]
+		fwdTruncated = true
 	}
 	snap := consolestore.RequestSnapshot{
 		RequestID:    meta.requestID,
@@ -458,8 +461,20 @@ func (h *Handler) recordRequest(meta requestLogMeta, r *http.Request, forwardBod
 		Path:         meta.path,
 		TargetURL:    meta.route.TargetURL,
 		RequestModel: meta.requestModel,
-		ForwardedPayload: &fwdPayload,
-		SourceRequestType: "generic",
+		ForwardedPayload:   &fwdPayload,
+		ForwardedTruncated: fwdTruncated,
+		SourceRequestType:  "generic",
+	}
+	// Preserve the original inbound body (before any Responses→Chat conversion
+	// or model rewrite) so the detail view can show what the client sent. This
+	// is only meaningful for POST bodies; GET/DELETE have none.
+	if len(rawBody) > 0 {
+		orig := string(rawBody)
+		if len(orig) > consolestorePayloadLimit {
+			orig = orig[:consolestorePayloadLimit]
+			snap.OriginalTruncated = true
+		}
+		snap.OriginalPayload = &orig
 	}
 	if meta.apiKey != nil {
 		snap.APIKeyID = &meta.apiKey.ID

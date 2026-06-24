@@ -73,12 +73,12 @@ func (ConsoleAPIKey) TableName() string { return "console_api_keys" }
 type ConsoleRequest struct {
 	RequestID                    string  `gorm:"column:request_id;primaryKey;type:varchar(128)"`
 	CreatedAt                    int64   `gorm:"column:created_at;index"`
-	RoutePrefix                  string  `gorm:"column:route_prefix"`
+	RoutePrefix                  string  `gorm:"column:route_prefix;index"`
 	UpstreamType                 string  `gorm:"column:upstream_type;default:anthropic"`
 	Method                       string  `gorm:"column:method"`
 	Path                         string  `gorm:"column:path"`
 	TargetURL                    string  `gorm:"column:target_url"`
-	RequestModel                 string  `gorm:"column:request_model"`
+	RequestModel                 string  `gorm:"column:request_model;index"`
 	APIKeyID                     *string `gorm:"column:api_key_id"`
 	APIKeyName                   *string `gorm:"column:api_key_name"`
 	OriginalPayload              *string `gorm:"column:original_payload"`
@@ -90,7 +90,7 @@ type ConsoleRequest struct {
 	OriginalHeadersJSON          *string `gorm:"column:original_headers_json"`
 	ForwardHeadersJSON           *string `gorm:"column:forward_headers_json"`
 	ResponseHeadersJSON          *string `gorm:"column:response_headers_json"`
-	ResponseStatus               *int    `gorm:"column:response_status"`
+	ResponseStatus               *int    `gorm:"column:response_status;index"`
 	ResponseStatusText           *string `gorm:"column:response_status_text"`
 	ResponsePayload              *string `gorm:"column:response_payload"`
 	ResponsePayloadTruncated     int     `gorm:"column:response_payload_truncated;default:0"`
@@ -100,7 +100,7 @@ type ConsoleRequest struct {
 	FirstTokenAt                 *int64  `gorm:"column:first_token_at"`
 	CompletedAt                  *int64  `gorm:"column:completed_at"`
 	HasStreamingContent          int     `gorm:"column:has_streaming_content;default:0"`
-	ResponseModel                *string `gorm:"column:response_model"`
+	ResponseModel                *string `gorm:"column:response_model;index"`
 	StopReason                   *string `gorm:"column:stop_reason"`
 	InputTokens                  int     `gorm:"column:input_tokens;default:0"`
 	OutputTokens                 int     `gorm:"column:output_tokens;default:0"`
@@ -124,17 +124,6 @@ type ConsoleRequest struct {
 
 // TableName fixes the table name.
 func (ConsoleRequest) TableName() string { return "console_requests" }
-
-// ModelCatalogCache maps the model_catalog_cache table.
-type ModelCatalogCache struct {
-	ModelID       string  `gorm:"column:model_id;primaryKey;type:varchar(255)"`
-	ContextWindow *int    `gorm:"column:context_window"`
-	PricingJSON   *string `gorm:"column:pricing_json;type:text"`
-	FetchedAt     int64   `gorm:"column:fetched_at"`
-}
-
-// TableName fixes the table name.
-func (ModelCatalogCache) TableName() string { return "model_catalog_cache" }
 
 // ModelMetadataOverride maps the model_metadata_overrides table.
 type ModelMetadataOverride struct {
@@ -166,15 +155,63 @@ const (
 	SettingsKeyFailover = "gateway.failover"
 )
 
+// RequestStats5m is one 5-minute rollup bucket of request metrics, keyed by
+// (bucket_start, route_prefix, request_model, api_key_name). It is populated by
+// a periodic background job (internal/statsstore) so the Usage/Monitor dashboards
+// can SUM these rows instead of scanning console_requests — which means stats
+// stay accurate even after old log rows are pruned by the retention cap.
+//
+// Larger time windows (30m/1h/24h) are produced by grouping multiple 5m rows.
+// Cost columns are pre-computed with the catalog at rollup time, so queries
+// never need to re-price. Each row also tracks max_request_created_at so the
+// rollup cursor (which request rows have been processed) can be derived from
+// the table itself — no separate cursor store needed.
+type RequestStats5m struct {
+	ID               int64   `gorm:"column:id;primaryKey;autoIncrement"`
+	BucketStart      int64   `gorm:"column:bucket_start;uniqueIndex:idx_request_stats_5m_dim"`
+	RoutePrefix      string  `gorm:"column:route_prefix;uniqueIndex:idx_request_stats_5m_dim"`
+	RequestModel     string  `gorm:"column:request_model;uniqueIndex:idx_request_stats_5m_dim"`
+	APIKeyName       string  `gorm:"column:api_key_name;uniqueIndex:idx_request_stats_5m_dim"`
+	Requests         int64   `gorm:"column:requests"`
+	Errors           int64   `gorm:"column:errors"`
+	Failovers        int64   `gorm:"column:failovers"`
+	CacheHits        int64   `gorm:"column:cache_hits"`
+	CacheCreates     int64   `gorm:"column:cache_creates"`
+	InputTokens      int64   `gorm:"column:input_tokens"`
+	OutputTokens     int64   `gorm:"column:output_tokens"`
+	CacheReadTokens  int64   `gorm:"column:cache_read_tokens"`
+	CacheCreateTokens int64  `gorm:"column:cache_creation_tokens"`
+	CachedInputTokens int64  `gorm:"column:cached_input_tokens"`
+	ReasoningTokens  int64   `gorm:"column:reasoning_tokens"`
+	InputCostUSD     float64 `gorm:"column:input_cost_usd"`
+	OutputCostUSD    float64 `gorm:"column:output_cost_usd"`
+	CacheReadCostUSD float64 `gorm:"column:cache_read_cost_usd"`
+	CacheWriteCostUSD float64 `gorm:"column:cache_write_cost_usd"`
+	// Latency aggregates (so avg cards have data without a separate scan).
+	SumDurationMs     int64 `gorm:"column:sum_duration_ms"`
+	SumFirstTokenMs   int64 `gorm:"column:sum_first_token_ms"`
+	CountTimed        int64 `gorm:"column:count_timed"`
+	// Cursor: the largest console_requests.created_at folded into this row. The
+	// rollup job advances its watermark to MAX(max_request_created_at) so it only
+	// re-scans rows seen since the last tick.
+	MaxRequestCreatedAt int64 `gorm:"column:max_request_created_at;index"`
+	CreatedAt           int64 `gorm:"column:created_at"`
+}
+
+// TableName fixes the table name.
+func (RequestStats5m) TableName() string { return "request_stats_5m" }
+
 // AllModels returns every model so AutoMigrate can create/migrate them all.
+// Note: model_catalog_cache is intentionally absent — the catalog is held in
+// memory only (see internal/catalog).
 func AllModels() []interface{} {
 	return []interface{}{
 		&ConsoleProvider{},
 		&ModelAlias{},
 		&ConsoleAPIKey{},
 		&ConsoleRequest{},
-		&ModelCatalogCache{},
 		&ModelMetadataOverride{},
 		&GatewaySetting{},
+		&RequestStats5m{},
 	}
 }

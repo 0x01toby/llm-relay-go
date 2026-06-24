@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -82,8 +83,43 @@ func (r *Runner) Run(ctx context.Context) Status {
 		log.Printf("[DB] Migration failed: %v", err)
 		return Status{State: StateFailed, Err: err.Error()}
 	}
+	// Expression indexes (e.g. ORDER BY input_tokens+output_tokens) can't be
+	// declared via GORM struct tags, so add them here, idempotently.
+	ensureIndexes(ctx, gdb)
 	log.Printf("[DB] Migrations complete.")
 	return Status{State: StateSuccess}
+}
+
+// ensureIndexes creates indexes that GORM's struct-tag AutoMigrate can't express
+// — specifically the functional index backing the "tokens" sort on the request
+// list (ORDER BY input_tokens + output_tokens). Each statement is idempotent and
+// best-effort: a failure only logs, never blocks startup (the query still works,
+// just slower). Syntax is dialect-adapted: SQLite & Postgres accept CREATE INDEX
+// IF NOT EXISTS with a parenthesized expression; MySQL 8+ supports functional
+// indexes but not IF NOT EXISTS, so we rely on CREATE INDEX failing silently on
+// the duplicate.
+func ensureIndexes(ctx context.Context, gdb *gorm.DB) {
+	dialect, _ := db.DetectDialect(gdb.Dialector.Name())
+	// GORM's Dialector.Name() returns the driver name; DetectDialect parses a
+	// URL scheme. Reconcile by matching common names.
+	dn := gdb.Dialector.Name()
+	switch {
+	case strings.Contains(dn, "sqlite") || strings.Contains(dn, "postgres") || strings.Contains(dn, "pg"):
+		execIgnoreDup(ctx, gdb,
+			`CREATE INDEX IF NOT EXISTS idx_console_requests_tokens_sort ON console_requests ((input_tokens + output_tokens))`)
+	case strings.Contains(dn, "mysql"):
+		execIgnoreDup(ctx, gdb,
+			`CREATE INDEX idx_console_requests_tokens_sort ON console_requests ((input_tokens + output_tokens))`)
+	}
+	_ = dialect
+}
+
+// execIgnoreDup runs a DDL statement, swallowing "already exists" style errors
+// so re-running migrations is safe. Other errors are logged, not fatal.
+func execIgnoreDup(ctx context.Context, gdb *gorm.DB, stmt string) {
+	if err := gdb.WithContext(ctx).Exec(stmt).Error; err != nil {
+		log.Printf("[DB] index (non-fatal): %v", err)
+	}
 }
 
 // waitForDbReady retries connecting until the database accepts connections or

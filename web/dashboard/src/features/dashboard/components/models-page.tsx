@@ -46,6 +46,13 @@ import type { ConsoleModelPricing, GatewayModel, TestProviderResult } from "@/fe
 
 function formatContext(context?: number) {
   if (!context) return "--"
+  // Compact representation: 1K / 128K / 1M / 2M. Use M once we hit a million
+  // so large windows don't render as "1000K".
+  if (context >= 1_000_000) {
+    const m = context / 1_000_000
+    // Drop trailing ".0" for whole numbers (1M, not 1.0M).
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`
+  }
   if (context >= 1000) return `${(context / 1000).toLocaleString("en-US")}K`
   return String(context)
 }
