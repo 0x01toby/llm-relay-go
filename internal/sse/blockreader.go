@@ -8,6 +8,7 @@ package sse
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"strings"
 )
@@ -37,9 +38,13 @@ func (b *BlockReader) Next() (string, bool, error) {
 
 	for {
 		chunk, err := b.r.ReadSlice('\n')
-		// bufio.ReadSlice can return both data and an error (ErrBufferFull), but
-		// SSE lines fit comfortably in the default 4KB buffer for our use case.
-		// We accept the slice regardless and append it.
+		// Guard against an upstream sending a single SSE line longer than
+		// the buffer (e.g. a huge JSON data payload with no newline). Without
+		// this, ErrBufferFull would cause the buffer to grow without bound.
+		if err == bufio.ErrBufferFull {
+			b.done = true
+			return "", false, fmt.Errorf("SSE line exceeds %d-byte buffer limit", b.r.Size())
+		}
 		if len(chunk) > 0 {
 			b.buffer.Write(chunk)
 		}

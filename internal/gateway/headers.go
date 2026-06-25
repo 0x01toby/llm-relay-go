@@ -14,9 +14,11 @@ import (
 const authTimeout = 5 * time.Second
 
 // requestContext returns a context with a short timeout for auth DB lookups.
-func requestContext() context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), authTimeout)
-	return ctx
+// The caller MUST defer the returned cancel func to avoid leaking timer
+// resources (previously the cancel was discarded, causing timer goroutine
+// buildup under high concurrency).
+func requestContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), authTimeout)
 }
 
 // hopByHopHeaders are stripped from forwarded requests per RFC 7230 §6.1,

@@ -74,7 +74,7 @@ type PoolConfig struct {
 // DefaultPoolConfig returns sensible production defaults.
 func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{
-		MaxConns:        10,
+		MaxConns:        25,
 		MinConns:        0,
 		MaxConnLifetime: 30 * time.Minute,
 		MaxConnIdleTime: 5 * time.Minute,

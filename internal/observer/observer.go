@@ -113,6 +113,7 @@ func (c *Capturer) observe() {
 	buf.Grow(8192)
 	chunkBuf := make([]byte, 4096)
 	firstChunk := true
+	captureFull := true // false once we hit MaxCaptureBytes; skip buf writes thereafter
 
 	for {
 		n, err := c.pipeReader.Read(chunkBuf)
@@ -124,12 +125,13 @@ func (c *Capturer) observe() {
 				firstChunk = false
 			}
 			res.BodyBytes += n
-			if buf.Len() < MaxCaptureBytes {
+			if captureFull && buf.Len() < MaxCaptureBytes {
 				remaining := MaxCaptureBytes - buf.Len()
 				if n > remaining {
 					buf.Write(chunkBuf[:remaining])
 					res.Truncated = true
 					res.TruncationReason = logging.TruncSizeLimit
+					captureFull = false // stop buffering; just track byte count
 				} else {
 					buf.Write(chunkBuf[:n])
 				}

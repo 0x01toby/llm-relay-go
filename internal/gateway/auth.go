@@ -87,7 +87,9 @@ func AuthenticateGateway(h http.Header, upstreamType configstore.UpstreamType, r
 		if keyRepo == nil {
 			break
 		}
-		row, ok := keyRepo.Authenticate(requestContext(), c.credential)
+		ctx, cancel := requestContext()
+		row, ok := keyRepo.Authenticate(ctx, c.credential)
+		cancel()
 		if !ok {
 			continue
 		}

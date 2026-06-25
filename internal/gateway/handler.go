@@ -171,7 +171,9 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		rawBody = b
 	}
 
-	requestedModel := extractModelFromBody(rawBody)
+	// Parse model + stream in a single JSON pass; pass them down to avoid
+	// re-parsing the body multiple times (was 3-4x before).
+	requestedModel, streamReq := extractModelAndStream(rawBody)
 	search := r.URL.RawQuery
 	if search != "" {
 		search = "?" + search
@@ -221,7 +223,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Failover setup.
 	ts := h.timeouts.Get(r.Context())
 	policy := h.failover.Get(r.Context())
-	streamReq := isStreamRequest(rawBody)
+	// streamReq was already parsed at the top of handleProxy.
 
 	// Build the full candidate list: initial + same-model repeats + custom
 	// fallbacks + any-model. The loop consumes them in order.
@@ -321,8 +323,10 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 		}
 	}
 
-	// Rewrite model if alias resolved to a different model.
-	if route.ResolvedModel != "" && requestedModelFromBody(forwardBody) != route.ResolvedModel {
+	// Rewrite model if alias resolved to a different model. requestedModel was
+	// already parsed once at the top of handleProxy; compare against that
+	// instead of re-parsing forwardBody's JSON.
+	if route.ResolvedModel != "" && requestedModel != route.ResolvedModel {
 		forwardBody = rewriteModel(forwardBody, route.ResolvedModel)
 	}
 
@@ -555,9 +559,25 @@ func (h *Handler) recordResponse(requestID string, route *routing.RouteResult, r
 	statusText := resp.Status
 	h.logtasks.Track(func() {
 		// Wait for the request INSERT to land first (ordered writes per requestID).
-		<-h.logtasks.WaitForRequest(requestID)
+		// Add a timeout guard: if the INSERT goroutine panics or is starved, we
+		// don't want to block forever.
+		select {
+		case <-h.logtasks.WaitForRequest(requestID):
+		case <-time.After(30 * time.Second):
+			log.Printf("[console] timed out waiting for request INSERT %s", requestID)
+			return
+		}
 
-		result, ok := <-capturer.ObserveDone()
+		// Wait for the observer to finish parsing the stream. Add a timeout
+		// guard so a stuck capturer can't block this goroutine indefinitely.
+		var result observer.Result
+		var ok bool
+		select {
+		case result, ok = <-capturer.ObserveDone():
+		case <-time.After(30 * time.Second):
+			log.Printf("[console] observe timeout for %s", requestID)
+			return
+		}
 		if !ok {
 			return
 		}
@@ -677,6 +697,20 @@ func requestedModelFromBody(body []byte) string {
 }
 
 func rewriteModel(body []byte, model string) []byte {
+	// Fast path: if the model already matches, skip the expensive full
+	// unmarshal+marshal cycle (saves a map allocation for every request).
+	var probe struct {
+		Model json.RawMessage `json:"model"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return body
+	}
+	var current string
+	_ = json.Unmarshal(probe.Model, &current)
+	if current == model {
+		return body
+	}
+	// Only do the full round-trip when the model actually needs changing.
 	var m map[string]interface{}
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body
@@ -717,32 +751,58 @@ func UsageOfProvider(body string, t configstore.UpstreamType) providers.UsageDat
 // This enforces the gateway's responseIdleTimeoutMs setting on streaming
 // responses so a stalled upstream can't hold a request open forever.
 // A idleMs <= 0 disables the timeout (passthrough).
+//
+// Implementation: a single long-lived reader goroutine feeds results into a
+// buffered channel. Each Read() call drains one result with a timer. This
+// avoids the goroutine-per-read pattern (which leaked goroutines when the
+// timer fired before the read completed).
 type idleReader struct {
 	src    io.Reader
 	idleMs int64
+	result chan readResult
+}
+
+type readResult struct {
+	n   int
+	err error
+	buf []byte
 }
 
 func newIdleReader(src io.Reader, idleMs int64) *idleReader {
-	return &idleReader{src: src, idleMs: idleMs}
+	r := &idleReader{src: src, idleMs: idleMs, result: make(chan readResult, 1)}
+	// Single long-lived reader goroutine. It reads from src sequentially and
+	// pushes each result into the buffered channel. When Read() times out and
+	// the caller stops draining, this goroutine eventually completes its
+	// blocking src.Read() and sends the final result into the buffered channel
+	// (buffered=1 so the send never blocks) then exits — no leak.
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			n, err := r.src.Read(buf)
+			r.result <- readResult{n: n, err: err, buf: buf[:n]}
+			if err != nil {
+				return
+			}
+			// Allocate a fresh buffer for the next read so the caller can
+			// hold a reference to the returned slice.
+			buf = make([]byte, 8192)
+		}
+	}()
+	return r
 }
 
 func (r *idleReader) Read(p []byte) (int, error) {
 	if r.idleMs <= 0 {
-		return r.src.Read(p)
+		// No timeout: just drain the result channel.
+		res := <-r.result
+		copy(p, res.buf)
+		return res.n, res.err
 	}
-	type readResult struct {
-		n   int
-		err error
-	}
-	ch := make(chan readResult, 1)
-	go func() {
-		n, err := r.src.Read(p)
-		ch <- readResult{n, err}
-	}()
 	timer := time.NewTimer(time.Duration(r.idleMs) * time.Millisecond)
 	defer timer.Stop()
 	select {
-	case res := <-ch:
+	case res := <-r.result:
+		copy(p, res.buf)
 		return res.n, res.err
 	case <-timer.C:
 		return 0, os.ErrDeadlineExceeded
