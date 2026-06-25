@@ -229,6 +229,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// fallbacks + any-model. The loop consumes them in order.
 	allCandidates := h.buildFailoverCandidates(resolver, candidates, explicit, requestedModel, lookupPath, search, typeForced, policy)
 	attempted := map[string]bool{}
+	wroteResponse := false // tracks whether any forwardOnce wrote a response
 
 	for idx, route := range allCandidates {
 		key := route.ChannelName + ":" + route.ResolvedModel + ":" + route.TargetURL
@@ -245,17 +246,31 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		for try := 0; try < maxTries; try++ {
 			status, retried := h.forwardOnce(w, r, route, rawBody, ts, streamReq, policy, requestedModel, authResult.APIKey)
 			if !retried {
-				return // response written
+				return // response written successfully or terminally
+			}
+			if status != 0 {
+				// forwardOnce wrote a terminal error (non-network failure).
+				wroteResponse = true
 			}
 			if try+1 >= maxTries {
-				// Exhausted retries on this route; if there's a next candidate,
-				// the outer loop continues. Otherwise we already wrote an error.
-				if idx == len(allCandidates)-1 && status != 0 {
-					// Last candidate failed terminally; forwardOnce wrote the error.
-					return
+				if idx == len(allCandidates)-1 && wroteResponse {
+					return // last candidate, terminal error already written
 				}
 			}
 		}
+	}
+
+	// All candidates exhausted via network errors (status=0, no response written).
+	// Send a terminal 502 so the client gets a real error instead of empty 200.
+	if !wroteResponse {
+		cors.Apply(w.Header(), r)
+		writeJSON(w, 502, map[string]interface{}{
+			"type": "upstream_error",
+			"error": map[string]interface{}{
+				"type":    "all_upstreams_failed",
+				"message": "All upstream routes failed",
+			},
+		})
 	}
 }
 
@@ -280,6 +295,11 @@ func (h *Handler) buildFailoverCandidates(resolver *routing.Resolver, initial []
 	return dedupeCandidates(out)
 }
 
+// dedupeCandidates removes duplicate routes by (channel, model, targetURL).
+// NOTE: it reuses the input slice's backing array (out := routes[:0]). This is
+// safe because the only caller (buildFailoverCandidates) builds a fresh slice
+// via append and never reads it after this call. Do not reuse this function on
+// borrowed slices without copying first.
 func dedupeCandidates(routes []*routing.RouteResult) []*routing.RouteResult {
 	seen := map[string]bool{}
 	out := routes[:0]
@@ -342,6 +362,7 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 	ctx := r.Context()
 	timeoutMs := SelectFirstByteTimeout(r.URL.Path, targetURL, ts, streamReq)
 	reqCtx, reqCancel := context.WithCancel(ctx)
+	defer reqCancel() // covers ALL return paths; safe no-op once timer is stopped
 	var firstByteTimer *time.Timer
 	if timeoutMs > 0 {
 		firstByteTimer = time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
@@ -358,7 +379,6 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 		if firstByteTimer != nil {
 			firstByteTimer.Stop()
 		}
-		reqCancel()
 		h.writeTerminalError(w, route, 502, "Upstream request failed", err.Error())
 		return 502, false
 	}
@@ -371,7 +391,6 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 	if err != nil {
 		// Did the first-byte timer fire? Stop() returns false if it already ran.
 		timerFired := firstByteTimer != nil && !firstByteTimer.Stop()
-		reqCancel()
 		isTimeout := timerFired
 		trigger := FailoverTrigger{Kind: TriggerNetworkError}
 		if isTimeout {

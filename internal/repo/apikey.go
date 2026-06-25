@@ -124,8 +124,9 @@ func (r *APIKeyRepo) Clear(ctx context.Context) error {
 	return r.db.WithContext(ctx).Where("1 = 1").Delete(&schema.ConsoleAPIKey{}).Error
 }
 
-// Authenticate looks up a key by hash (non-revoked), best-effort updates
-// last_used_at, and returns the row. Returns false on miss or DB error.
+// Authenticate looks up a key by hash (non-revoked), throttled best-effort
+// updates last_used_at (at most once per lastUsedThrottleMs per process), and
+// returns the row. Returns false on miss or DB error.
 func (r *APIKeyRepo) Authenticate(ctx context.Context, rawKey string) (schema.ConsoleAPIKey, bool) {
 	rawKey = strings.TrimSpace(rawKey)
 	if rawKey == "" {
@@ -136,12 +137,24 @@ func (r *APIKeyRepo) Authenticate(ctx context.Context, rawKey string) (schema.Co
 	if err != nil {
 		return schema.ConsoleAPIKey{}, false
 	}
-	// Best-effort last_used_at update.
-	_ = r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).
-		Where("id = ? AND revoked <> 1", row.ID).
-		Update("last_used_at", nowMs()).Error
+	// Throttled last_used_at update: only write if the stored value is older
+	// than lastUsedThrottleMs. This avoids a synchronous UPDATE on every single
+	// request for a hot key (write amplification + row lock contention).
+	lastUsed := int64(0)
+	if row.LastUsedAt != nil {
+		lastUsed = *row.LastUsedAt
+	}
+	if lastUsed == 0 || nowMs()-lastUsed > lastUsedThrottleMs {
+		_ = r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).
+			Where("id = ? AND revoked <> 1", row.ID).
+			Update("last_used_at", nowMs()).Error
+	}
 	return row, true
 }
+
+// lastUsedThrottleMs is the minimum interval between last_used_at writes for
+// the same key (30s). Prevents write amplification on hot keys.
+const lastUsedThrottleMs int64 = 30_000
 
 // SetAllowedModels replaces a key's model allowlist. Models are trimmed,
 // de-duplicated, non-empty.

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/taozhang/llmrelay/internal/providers"
 	"github.com/taozhang/llmrelay/internal/schema"
@@ -117,43 +118,21 @@ func (r *Repository) SaveRequest(ctx context.Context, s RequestSnapshot) error {
 		RetryAttempt:            s.RetryAttempt,
 		SourceRequestType:       s.SourceRequestType,
 	}
-	// Upsert on the request_id primary key.
-	res := r.db.WithContext(ctx).Create(&row)
-	if res.Error != nil {
-		// On duplicate primary key, do an update.
-		if isDuplicateKey(res.Error) {
-			if err := r.db.WithContext(ctx).Model(&schema.ConsoleRequest{}).
-				Where("request_id = ?", s.RequestID).
-				Updates(map[string]interface{}{
-					"route_prefix":            row.RoutePrefix,
-					"upstream_type":           row.UpstreamType,
-					"method":                  row.Method,
-					"path":                    row.Path,
-					"target_url":              row.TargetURL,
-					"request_model":           row.RequestModel,
-					"api_key_id":              row.APIKeyID,
-					"api_key_name":            row.APIKeyName,
-					"original_payload":        row.OriginalPayload,
-					"original_payload_truncated": row.OriginalPayloadTruncated,
-					"original_summary_json":   row.OriginalSummaryJSON,
-					"forwarded_payload":       row.ForwardedPayload,
-					"forwarded_payload_truncated": row.ForwardedPayloadTruncated,
-					"forwarded_summary_json":  row.ForwardedSummaryJSON,
-					"original_headers_json":   row.OriginalHeadersJSON,
-					"forward_headers_json":    row.ForwardHeadersJSON,
-					"failover_from":           row.FailoverFrom,
-					"failover_chain_json":     row.FailoverChainJSON,
-					"original_route_prefix":   row.OriginalRoutePrefix,
-					"original_request_model":  row.OriginalRequestModel,
-					"failover_reason":         row.FailoverReason,
-					"retry_attempt":           row.RetryAttempt,
-					"source_request_type":     row.SourceRequestType,
-				}).Error; err != nil {
-				return fmt.Errorf("save request: %w", err)
-			}
-		} else {
-			return fmt.Errorf("save request: %w", res.Error)
-		}
+	// Upsert on the request_id primary key. Use GORM's portable OnConflict so
+	// we don't depend on fragile error-string matching (isDuplicateKey).
+	if err := r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "request_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"route_prefix", "upstream_type", "method", "path", "target_url",
+			"request_model", "api_key_id", "api_key_name",
+			"original_payload", "original_payload_truncated", "original_summary_json",
+			"forwarded_payload", "forwarded_payload_truncated", "forwarded_summary_json",
+			"original_headers_json", "forward_headers_json",
+			"failover_from", "failover_chain_json", "original_route_prefix",
+			"original_request_model", "failover_reason", "retry_attempt", "source_request_type",
+		}),
+	}).Create(&row).Error; err != nil {
+		return fmt.Errorf("save request: %w", err)
 	}
 	return nil
 }

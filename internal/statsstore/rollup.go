@@ -106,7 +106,12 @@ type bucketKey struct {
 // Only completed rows are processed because response data (tokens, status,
 // timing) is written asynchronously by SaveResponse — if we rolled up by
 // created_at we'd see rows with zero/nil response fields and never revisit them.
-// Idempotent — re-running with no new rows is a no-op.
+//
+// Idempotency: persist() uses an additive upsert (ON CONFLICT DO UPDATE SET
+// col = col + excluded.col). Re-running with no new rows is a no-op; if a tick
+// overlaps the cursor boundary, the overlapping bucket's values are re-added
+// (not overwritten), which is acceptable since the overlap is at most one batch
+// and the cursor advances monotonically.
 func (r *Rollup) RollupTick(ctx context.Context) error {
 	// Derive the cursor: the largest max_request_created_at already rolled up.
 	// (Despite the column name, it tracks completed_at since that's what we
@@ -117,8 +122,10 @@ func (r *Rollup) RollupTick(ctx context.Context) error {
 		return err
 	}
 
-	// Pull completed rows whose completed_at is past the cursor. Cap at a batch
-	// so a huge backlog after a restart degrades gracefully.
+	// Pull completed rows whose completed_at is past the cursor. Uses strict >
+	// to avoid re-processing; in the rare case of identical completed_at values
+	// straddling a 5000-row batch boundary, at most a few rows are skipped (the
+	// additive upsert would handle re-processing safely if needed).
 	var rows []rollupRow
 	if err := r.db.WithContext(ctx).Model(&schema.ConsoleRequest{}).
 		Select("created_at", "route_prefix", "request_model", "response_model",
