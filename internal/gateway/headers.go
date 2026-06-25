@@ -41,7 +41,16 @@ func BuildForwardHeaders(source http.Header, auth *configstore.AuthConfig) http.
 		// Remove any client-provided credentials, then set the configured one.
 		out.Del("authorization")
 		out.Del("x-api-key")
-		out.Set(strings.ToLower(auth.Header), auth.Value)
+		header := strings.ToLower(auth.Header)
+		value := auth.Value
+		// OpenAI-compatible upstreams require "Bearer <key>" in the
+		// Authorization header. The DB stores the bare key, so add the prefix
+		// here (matching applyAuthHeader in upstream.go). Anthropic uses
+		// x-api-key with no prefix.
+		if header == "authorization" && !strings.HasPrefix(value, "Bearer ") {
+			value = "Bearer " + value
+		}
+		out.Set(header, value)
 	}
 	return out
 }
