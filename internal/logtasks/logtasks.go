@@ -74,6 +74,12 @@ func (c *Coordinator) TrackRequestWrite(requestID string, fn func()) <-chan stru
 		defer func() {
 			c.mu.Lock()
 			c.count--
+			// Remove this request's entry once its chain is exhausted, so the
+			// map doesn't grow unbounded over the process lifetime. Only
+			// delete if no newer task for this requestID chained onto us.
+			if cur, ok := c.last[requestID]; ok && cur == done {
+				delete(c.last, requestID)
+			}
 			c.mu.Unlock()
 		}()
 		if prev != nil {

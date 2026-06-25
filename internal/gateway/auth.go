@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/taozhang/llmrelay/internal/configstore"
@@ -105,7 +106,7 @@ func AuthenticateGateway(h http.Header, upstreamType configstore.UpstreamType, r
 			if apiKey.CostQuota != nil {
 				quota = *apiKey.CostQuota
 			}
-			detail := "已用 $" + ftoa(snap.CostUsed, 6) + " / 额度 $" + ftoa(float64(quota)/1e6, 6)
+			detail := "已用 $" + strconv.FormatFloat(snap.CostUsed, 'f', 6, 64) + " / 额度 $" + strconv.FormatFloat(float64(quota)/1e6, 'f', 6, 64)
 			ak := apiKey
 			return GatewayAuthResult{
 				OK:     true,
@@ -219,32 +220,4 @@ func jsonString(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
-}
-
-// ftoa formats a float with fixed precision.
-func ftoa(f float64, prec int) string {
-	negative := f < 0
-	if negative {
-		f = -f
-	}
-	// Round to prec decimals.
-	mult := 1.0
-	for i := 0; i < prec; i++ {
-		mult *= 10
-	}
-	rounded := int64(f*mult + 0.5)
-	intPart := rounded / int64(mult)
-	frac := rounded % int64(mult)
-	s := itoa(int(intPart))
-	if prec > 0 {
-		fracStr := itoa(int(frac))
-		for len(fracStr) < prec {
-			fracStr = "0" + fracStr
-		}
-		s = s + "." + fracStr
-	}
-	if negative {
-		s = "-" + s
-	}
-	return s
 }

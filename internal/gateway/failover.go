@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,7 @@ func DescribeTrigger(t FailoverTrigger) string {
 	case TriggerNetworkError:
 		return "network_error"
 	}
-	return "http_" + itoa(t.Status)
+	return "http_" + strconv.Itoa(t.Status)
 }
 
 // ShouldTriggerFailover reports whether the policy says to retry/failover on
@@ -268,26 +269,3 @@ func parseURL(s string) (*url.URL, error) { return url.Parse(s) }
 func toLower(s string) string             { return strings.ToLower(s) }
 func contains(s, sub string) bool         { return strings.Contains(s, sub) }
 
-// itoa is a tiny strconv.Itoa alias kept local to avoid pulling strconv into
-// every file that references failover triggers.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [12]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}

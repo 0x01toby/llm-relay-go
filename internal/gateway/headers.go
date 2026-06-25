@@ -4,13 +4,20 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/taozhang/llmrelay/internal/configstore"
 )
 
-// requestContext returns a background context for auth calls that don't need
-// request-scoped cancellation (the auth DB lookup is fast and non-critical).
-func requestContext() context.Context { return context.Background() }
+// authTimeout caps how long an auth DB lookup may take. Prevents request
+// pile-up if the database stalls.
+const authTimeout = 5 * time.Second
+
+// requestContext returns a context with a short timeout for auth DB lookups.
+func requestContext() context.Context {
+	ctx, _ := context.WithTimeout(context.Background(), authTimeout)
+	return ctx
+}
 
 // hopByHopHeaders are stripped from forwarded requests per RFC 7230 §6.1,
 // plus headers we regenerate. Mirrors the original's deletion list.

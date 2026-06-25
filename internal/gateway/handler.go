@@ -9,14 +9,17 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/taozhang/llmrelay/internal/catalog"
 	"github.com/taozhang/llmrelay/internal/configstore"
 	"github.com/taozhang/llmrelay/internal/consolestore"
 	"github.com/taozhang/llmrelay/internal/cors"
 	"github.com/taozhang/llmrelay/internal/logtasks"
 	"github.com/taozhang/llmrelay/internal/observer"
+	"github.com/taozhang/llmrelay/internal/pricing"
 	"github.com/taozhang/llmrelay/internal/providers"
 	"github.com/taozhang/llmrelay/internal/repo"
 	"github.com/taozhang/llmrelay/internal/responsesconv"
@@ -42,13 +45,21 @@ type Handler struct {
 	httpClient   *http.Client
 	requests     *consolestore.Repository
 	logtasks     *logtasks.Coordinator
+	pricing      priceLooker // catalog for per-request cost → quota consumption
+}
+
+// priceLooker is the subset of catalog.Service the gateway needs: resolving a
+// model's per-1M-token pricing so it can charge managed API keys.
+type priceLooker interface {
+	LookupPricing(modelID string) *pricing.ModelPricing
 }
 
 // NewHandler builds a gateway Handler. requests and logtasks enable response
-// observation; pass nil to disable logging (e.g. in degraded mode).
-func NewHandler(gdb *gorm.DB, store *configstore.Store, adminKey string, cfgTimeouts TimeoutSettings, requests *consolestore.Repository, lt *logtasks.Coordinator) *Handler {
+// observation; pass nil to disable logging (e.g. in degraded mode). cat supplies
+// per-model pricing for quota consumption; pass nil to disable quota charging.
+func NewHandler(gdb *gorm.DB, store *configstore.Store, adminKey string, cfgTimeouts TimeoutSettings, requests *consolestore.Repository, lt *logtasks.Coordinator, cat *catalog.Service) *Handler {
 	settingsRepo := repo.NewSettingsRepo(gdb)
-	return &Handler{
+	h := &Handler{
 		gdb:          gdb,
 		store:        store,
 		keyRepo:      repo.NewAPIKeyRepo(gdb),
@@ -66,6 +77,10 @@ func NewHandler(gdb *gorm.DB, store *configstore.Store, adminKey string, cfgTime
 			},
 		},
 	}
+	if cat != nil {
+		h.pricing = cat
+	}
+	return h
 }
 
 // ModelListHandler serves GET /v1/models (and the typed variants). It returns
@@ -108,24 +123,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // extractModelFromBody parses the "model" field from a JSON request body.
 func extractModelFromBody(body []byte) string {
-	var partial struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &partial); err != nil {
-		return ""
-	}
-	return strings.TrimSpace(partial.Model)
+	m, _ := extractModelAndStream(body)
+	return m
 }
 
 // isStreamRequest reports whether the request body has stream:true.
 func isStreamRequest(body []byte) bool {
+	_, s := extractModelAndStream(body)
+	return s
+}
+
+// extractModelAndStream parses both "model" and "stream" in a single JSON
+// unmarshal (they were previously decoded in two passes over the same body).
+func extractModelAndStream(body []byte) (model string, stream bool) {
 	var partial struct {
-		Stream bool `json:"stream"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &partial); err != nil {
-		return false
+		return "", false
 	}
-	return partial.Stream
+	return strings.TrimSpace(partial.Model), partial.Stream
 }
 
 // handleProxy drives the full request pipeline for one inbound request.
@@ -133,14 +151,21 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 	resolver := routing.NewResolver(h.store.Snapshot())
 
 	// Read the request body once (we need it for model extraction, auth, and
-	// forwarding).
+	// forwarding). Cap at maxRequestBodyBytes to prevent OOM from oversized
+	// payloads — an honest LLM request is well under this limit.
+	const maxRequestBodyBytes = 20 * 1024 * 1024 // 20 MiB
 	var rawBody []byte
 	if r.Method == http.MethodPost {
-		b, err := io.ReadAll(r.Body)
+		b, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
 		_ = r.Body.Close()
 		if err != nil {
 			cors.Apply(w.Header(), r)
 			writeJSON(w, 400, map[string]interface{}{"error": "failed to read request body"})
+			return
+		}
+		if len(b) > maxRequestBodyBytes {
+			cors.Apply(w.Header(), r)
+			writeJSON(w, 413, map[string]interface{}{"error": "request body too large", "limit_bytes": maxRequestBodyBytes})
 			return
 		}
 		rawBody = b
@@ -339,7 +364,6 @@ func (h *Handler) forwardOnce(w http.ResponseWriter, r *http.Request, route *rou
 	}
 
 	resp, err := h.httpClient.Do(upReq)
-	log.Printf("[DEBUG] httpClient.Do: err=%v resp=%v targetURL=%s", err, resp != nil, targetURL)
 	if err != nil {
 		// Did the first-byte timer fire? Stop() returns false if it already ran.
 		timerFired := firstByteTimer != nil && !firstByteTimer.Stop()
@@ -444,10 +468,20 @@ func (h *Handler) streamResponse(w http.ResponseWriter, r *http.Request, resp *h
 
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 8192)
+	// Wrap the body reader with an idle timeout so a stalled upstream (data
+	// stops flowing mid-stream) doesn't hold the request open forever.
+	// ResponseIdleMs comes from the gateway timeout settings (default 300s).
+	idleMs := h.timeouts.Get(r.Context()).ResponseIdleMs
+	reader := newIdleReader(clientBody, idleMs)
 	for {
-		n, err := clientBody.Read(buf)
+		n, err := reader.Read(buf)
 		if n > 0 {
-			_, _ = w.Write(buf[:n])
+			// Detect client disconnect: if Write fails the client is gone, so
+			// stop reading upstream (saves bandwidth) and let the observer
+			// goroutine finish via capturer.Close() below.
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				break
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -460,7 +494,7 @@ func (h *Handler) streamResponse(w http.ResponseWriter, r *http.Request, resp *h
 	// If we captured the response, record it asynchronously.
 	if capturer != nil {
 		capturer.Close()
-		h.recordResponse(requestID, route, resp, capturer)
+		h.recordResponse(requestID, route, resp, capturer, apiKey)
 	}
 }
 
@@ -513,7 +547,7 @@ func (h *Handler) recordRequest(meta requestLogMeta, r *http.Request, forwardBod
 
 // recordResponse asynchronously updates the request row with response data.
 // It waits for the INSERT (via logtasks serialization) before updating.
-func (h *Handler) recordResponse(requestID string, route *routing.RouteResult, resp *http.Response, capturer *observer.Capturer) {
+func (h *Handler) recordResponse(requestID string, route *routing.RouteResult, resp *http.Response, capturer *observer.Capturer, apiKey *AuthenticatedAPIKey) {
 	if h.requests == nil || h.logtasks == nil {
 		return
 	}
@@ -553,7 +587,39 @@ func (h *Handler) recordResponse(requestID string, route *routing.RouteResult, r
 		if err := h.requests.SaveResponse(ctx, snap); err != nil {
 			log.Printf("[console] save response %s: %v", requestID, err)
 		}
+
+		// Consume the managed API key's quota: price the response's token usage
+		// via the catalog and atomically increment cost_used_microusd. Admin
+		// requests (no apiKey) skip this. This is what makes configured quotas
+		// actually enforce — without it cost_used stays at 0 forever.
+		if apiKey != nil && apiKey.ID != "" {
+			h.chargeQuota(ctx, apiKey.ID, result.Usage)
+		}
 	})
+}
+
+// chargeQuota prices one response's usage and increments the key's spent total.
+func (h *Handler) chargeQuota(ctx context.Context, keyID string, usage providers.UsageData) {
+	if h.pricing == nil || h.keyRepo == nil {
+		return
+	}
+	modelID := usage.Model
+	if modelID == "" {
+		return
+	}
+	p := h.pricing.LookupPricing(modelID)
+	if p == nil {
+		return
+	}
+	cost := pricing.CalculateCost(usage, p)
+	// Convert USD → micro-USD for the integer column.
+	microusd := int64(cost * repo.MicroUSDPerUSD)
+	if microusd <= 0 {
+		return
+	}
+	if err := h.keyRepo.IncrementCostUsed(ctx, keyID, microusd); err != nil {
+		log.Printf("[console] quota charge %s: %v", keyID, err)
+	}
 }
 
 // consolestorePayloadLimit caps how much of a payload we store.
@@ -566,13 +632,15 @@ func strPtrOrNil(s string) *string {
 	return &s
 }
 
-// generateRequestID produces a short unique ID (8 hex chars), mirroring the
-// original's crypto.randomUUID().slice(0, 8).
+// generateRequestID produces a unique ID (16 hex chars = 8 random bytes).
+// The original used 4 bytes (8 hex chars) which has a ~50% collision chance at
+// ~65K concurrent requests (birthday paradox); 8 bytes makes collisions
+// astronomically unlikely.
 func generateRequestID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	const hex = "0123456789abcdef"
-	out := [8]byte{}
+	out := [16]byte{}
 	for i, v := range b {
 		out[i*2] = hex[v>>4]
 		out[i*2+1] = hex[v&0xf]
@@ -642,4 +710,41 @@ func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 // used by the response observer (P5 will wire the full observation).
 func UsageOfProvider(body string, t configstore.UpstreamType) providers.UsageData {
 	return providers.ParseUsage(body, providers.UpstreamType(t))
+}
+
+// idleReader wraps an io.Reader with a per-read idle timeout. If no data
+// arrives within idleMs between reads, Read returns os.ErrDeadlineExceeded.
+// This enforces the gateway's responseIdleTimeoutMs setting on streaming
+// responses so a stalled upstream can't hold a request open forever.
+// A idleMs <= 0 disables the timeout (passthrough).
+type idleReader struct {
+	src    io.Reader
+	idleMs int64
+}
+
+func newIdleReader(src io.Reader, idleMs int64) *idleReader {
+	return &idleReader{src: src, idleMs: idleMs}
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	if r.idleMs <= 0 {
+		return r.src.Read(p)
+	}
+	type readResult struct {
+		n   int
+		err error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		n, err := r.src.Read(p)
+		ch <- readResult{n, err}
+	}()
+	timer := time.NewTimer(time.Duration(r.idleMs) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-timer.C:
+		return 0, os.ErrDeadlineExceeded
+	}
 }

@@ -271,3 +271,15 @@ func BuildQuotaSnapshot(quotaMicrousd *int64, usedMicrousd int64) QuotaSnapshot 
 	}
 	return snap
 }
+
+// IncrementCostUsed atomically adds deltaMicrousd to a key's cost_used_microusd.
+// Called after a request completes to consume the key's quota. Silently ignores
+// an unknown id (e.g. admin key has no row).
+func (r *APIKeyRepo) IncrementCostUsed(ctx context.Context, id string, deltaMicrousd int64) error {
+	if id == "" || deltaMicrousd <= 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Model(&schema.ConsoleAPIKey{}).
+		Where("id = ?", id).
+		UpdateColumn("cost_used_microusd", gorm.Expr("cost_used_microusd + ?", deltaMicrousd)).Error
+}

@@ -123,10 +123,21 @@ type rollupBucket struct {
 	LastSeenAt      int64 // most recent bucket_start in this group
 }
 
+// allowedGroupCols is the allowlist of columns computeBucketsFromRollup may
+// GROUP BY. This prevents SQL injection if user input ever reaches groupCol.
+var allowedGroupCols = map[string]bool{
+	"route_prefix":   true,
+	"request_model":  true,
+	"api_key_name":   true,
+}
+
 // computeBucketsFromRollup groups request_stats_5m by groupCol and aggregates.
-// groupCol is route_prefix / request_model / api_key_name (caller-controlled).
+// groupCol must be in allowedGroupCols; anything else returns an error.
 // f supplies the time + cross-dimension filters.
 func computeBucketsFromRollup(ctx context.Context, gdb *gorm.DB, groupCol string, f rollupFilter) ([]rollupBucket, error) {
+	if !allowedGroupCols[groupCol] {
+		return nil, fmt.Errorf("invalid group column: %s", groupCol)
+	}
 	q := f.applyTo(gdb.WithContext(ctx).Model(&schema.RequestStats5m{}).Select(fmt.Sprintf(`
 		%s AS key,
 		COALESCE(SUM(requests), 0) AS requests,

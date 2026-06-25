@@ -33,3 +33,6 @@ web/dashboard/dist/
 .idea/
 .vscode/
 *.swp
+.gocache/
+deepseek.review.md
+gpt.review.md

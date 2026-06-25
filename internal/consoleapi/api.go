@@ -12,7 +12,6 @@
 package consoleapi
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -734,9 +733,6 @@ func parseListFilter(r *http.Request) consolestore.ListFilter {
 	}
 	return f
 }
-
-// quiet unused-import guard for context (used in some handlers).
-var _ = context.Background
 
 // --- Stats & filters ---
 
