@@ -91,7 +91,7 @@ func main() {
 		// Fold new request-log rows into the 5-minute stats rollup table every
 		// 3 minutes, so Usage/Monitor stats stay accurate even after old rows
 		// are pruned by the retention cap.
-		rollup := statsstore.NewRollup(gdb, cat)
+		rollup := statsstore.NewRollup(gdb, cat, dialect)
 		sched.Add("stats-rollup", 3*time.Minute, func(ctx context.Context) error {
 			return rollup.RollupTick(ctx)
 		})

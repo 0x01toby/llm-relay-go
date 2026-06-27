@@ -12,6 +12,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/taozhang/llmrelay/internal/db"
 	"github.com/taozhang/llmrelay/internal/pricing"
 	"github.com/taozhang/llmrelay/internal/schema"
 )
@@ -36,13 +37,14 @@ type priceLooker interface {
 // progress via max_request_created_at stored on each rollup row, so it only
 // re-scans rows seen since the last tick (incremental).
 type Rollup struct {
-	db  *gorm.DB
-	cat priceLooker
+	db      *gorm.DB
+	cat     priceLooker
+	dialect db.Dialect
 }
 
 // NewRollup builds a Rollup. cat may be nil to disable cost computation.
-func NewRollup(gdb *gorm.DB, cat priceLooker) *Rollup {
-	return &Rollup{db: gdb, cat: cat}
+func NewRollup(gdb *gorm.DB, cat priceLooker, dialect db.Dialect) *Rollup {
+	return &Rollup{db: gdb, cat: cat, dialect: dialect}
 }
 
 // rollupRow is a lightweight projection of one console_requests row, just the
@@ -268,7 +270,7 @@ func (r *Rollup) persist(ctx context.Context, aggs map[bucketKey]*aggregate) err
 				MaxRequestCreatedAt: ag.MaxRequestCreatedAt,
 				CreatedAt:           now,
 			}
-			if err := upsertAggregate(tx, &row); err != nil {
+			if err := r.upsertAggregate(tx, &row); err != nil {
 				return err
 			}
 		}
@@ -279,48 +281,95 @@ func (r *Rollup) persist(ctx context.Context, aggs map[bucketKey]*aggregate) err
 // upsertAggregate inserts a rollup row, or on a (bucket_start, route_prefix,
 // request_model, api_key_name) conflict adds this tick's values into the
 // existing row. The additive form keeps an open 5m bucket correct across
-// multiple ticks. Cross-dialect: SQLite, Postgres, and MySQL 8+ all support the
-// VALUES() function in ON DUPLICATE/ON CONFLICT DO UPDATE.
-func upsertAggregate(tx *gorm.DB, row *schema.RequestStats5m) error {
-	return tx.Exec(`INSERT INTO request_stats_5m (
-		bucket_start, route_prefix, request_model, api_key_name,
-		requests, errors, failovers, cache_hits, cache_creates,
-		input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-		cached_input_tokens, reasoning_tokens,
-		input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_write_cost_usd,
-		sum_duration_ms, sum_first_token_ms, sum_generation_ms, count_timed,
-		max_request_created_at, created_at
-	) VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?)
-	ON CONFLICT(bucket_start, route_prefix, request_model, api_key_name) DO UPDATE SET
-		requests = request_stats_5m.requests + excluded.requests,
-		errors = request_stats_5m.errors + excluded.errors,
-		failovers = request_stats_5m.failovers + excluded.failovers,
-		cache_hits = request_stats_5m.cache_hits + excluded.cache_hits,
-		cache_creates = request_stats_5m.cache_creates + excluded.cache_creates,
-		input_tokens = request_stats_5m.input_tokens + excluded.input_tokens,
-		output_tokens = request_stats_5m.output_tokens + excluded.output_tokens,
-		cache_read_tokens = request_stats_5m.cache_read_tokens + excluded.cache_read_tokens,
-		cache_creation_tokens = request_stats_5m.cache_creation_tokens + excluded.cache_creation_tokens,
-		cached_input_tokens = request_stats_5m.cached_input_tokens + excluded.cached_input_tokens,
-		reasoning_tokens = request_stats_5m.reasoning_tokens + excluded.reasoning_tokens,
-		input_cost_usd = request_stats_5m.input_cost_usd + excluded.input_cost_usd,
-		output_cost_usd = request_stats_5m.output_cost_usd + excluded.output_cost_usd,
-		cache_read_cost_usd = request_stats_5m.cache_read_cost_usd + excluded.cache_read_cost_usd,
-		cache_write_cost_usd = request_stats_5m.cache_write_cost_usd + excluded.cache_write_cost_usd,
-		sum_duration_ms = request_stats_5m.sum_duration_ms + excluded.sum_duration_ms,
-		sum_first_token_ms = request_stats_5m.sum_first_token_ms + excluded.sum_first_token_ms,
-		sum_generation_ms = request_stats_5m.sum_generation_ms + excluded.sum_generation_ms,
-		count_timed = request_stats_5m.count_timed + excluded.count_timed,
-		max_request_created_at = MAX(request_stats_5m.max_request_created_at, excluded.max_request_created_at),
-		created_at = excluded.created_at`,
-		row.BucketStart, row.RoutePrefix, row.RequestModel, row.APIKeyName,
-		row.Requests, row.Errors, row.Failovers, row.CacheHits, row.CacheCreates,
-		row.InputTokens, row.OutputTokens, row.CacheReadTokens, row.CacheCreateTokens,
-		row.CachedInputTokens, row.ReasoningTokens,
-		row.InputCostUSD, row.OutputCostUSD, row.CacheReadCostUSD, row.CacheWriteCostUSD,
-		row.SumDurationMs, row.SumFirstTokenMs, row.SumGenerationMs, row.CountTimed,
-		row.MaxRequestCreatedAt, row.CreatedAt,
-	).Error
+// multiple ticks.
+//
+// Dialect note: PostgreSQL and SQLite use ON CONFLICT … DO UPDATE SET with
+// EXCLUDED; MySQL/MariaDB use ON DUPLICATE KEY UPDATE with VALUES().
+func (r *Rollup) upsertAggregate(tx *gorm.DB, row *schema.RequestStats5m) error {
+	switch r.dialect {
+	case db.DialectMySQL:
+		return tx.Exec(`INSERT INTO request_stats_5m (
+			bucket_start, route_prefix, request_model, api_key_name,
+			requests, errors, failovers, cache_hits, cache_creates,
+			input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+			cached_input_tokens, reasoning_tokens,
+			input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_write_cost_usd,
+			sum_duration_ms, sum_first_token_ms, sum_generation_ms, count_timed,
+			max_request_created_at, created_at
+		) VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?)
+		ON DUPLICATE KEY UPDATE
+			requests = requests + VALUES(requests),
+			errors = errors + VALUES(errors),
+			failovers = failovers + VALUES(failovers),
+			cache_hits = cache_hits + VALUES(cache_hits),
+			cache_creates = cache_creates + VALUES(cache_creates),
+			input_tokens = input_tokens + VALUES(input_tokens),
+			output_tokens = output_tokens + VALUES(output_tokens),
+			cache_read_tokens = cache_read_tokens + VALUES(cache_read_tokens),
+			cache_creation_tokens = cache_creation_tokens + VALUES(cache_creation_tokens),
+			cached_input_tokens = cached_input_tokens + VALUES(cached_input_tokens),
+			reasoning_tokens = reasoning_tokens + VALUES(reasoning_tokens),
+			input_cost_usd = input_cost_usd + VALUES(input_cost_usd),
+			output_cost_usd = output_cost_usd + VALUES(output_cost_usd),
+			cache_read_cost_usd = cache_read_cost_usd + VALUES(cache_read_cost_usd),
+			cache_write_cost_usd = cache_write_cost_usd + VALUES(cache_write_cost_usd),
+			sum_duration_ms = sum_duration_ms + VALUES(sum_duration_ms),
+			sum_first_token_ms = sum_first_token_ms + VALUES(sum_first_token_ms),
+			sum_generation_ms = sum_generation_ms + VALUES(sum_generation_ms),
+			count_timed = count_timed + VALUES(count_timed),
+			max_request_created_at = GREATEST(max_request_created_at, VALUES(max_request_created_at)),
+			created_at = VALUES(created_at)`,
+			row.BucketStart, row.RoutePrefix, row.RequestModel, row.APIKeyName,
+			row.Requests, row.Errors, row.Failovers, row.CacheHits, row.CacheCreates,
+			row.InputTokens, row.OutputTokens, row.CacheReadTokens, row.CacheCreateTokens,
+			row.CachedInputTokens, row.ReasoningTokens,
+			row.InputCostUSD, row.OutputCostUSD, row.CacheReadCostUSD, row.CacheWriteCostUSD,
+			row.SumDurationMs, row.SumFirstTokenMs, row.SumGenerationMs, row.CountTimed,
+			row.MaxRequestCreatedAt, row.CreatedAt,
+		).Error
+	default:
+		// PostgreSQL and SQLite both support ON CONFLICT … DO UPDATE SET with
+		// EXCLUDED to reference the would-be-inserted row.
+		return tx.Exec(`INSERT INTO request_stats_5m (
+			bucket_start, route_prefix, request_model, api_key_name,
+			requests, errors, failovers, cache_hits, cache_creates,
+			input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+			cached_input_tokens, reasoning_tokens,
+			input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_write_cost_usd,
+			sum_duration_ms, sum_first_token_ms, sum_generation_ms, count_timed,
+			max_request_created_at, created_at
+		) VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?)
+		ON CONFLICT(bucket_start, route_prefix, request_model, api_key_name) DO UPDATE SET
+			requests = request_stats_5m.requests + excluded.requests,
+			errors = request_stats_5m.errors + excluded.errors,
+			failovers = request_stats_5m.failovers + excluded.failovers,
+			cache_hits = request_stats_5m.cache_hits + excluded.cache_hits,
+			cache_creates = request_stats_5m.cache_creates + excluded.cache_creates,
+			input_tokens = request_stats_5m.input_tokens + excluded.input_tokens,
+			output_tokens = request_stats_5m.output_tokens + excluded.output_tokens,
+			cache_read_tokens = request_stats_5m.cache_read_tokens + excluded.cache_read_tokens,
+			cache_creation_tokens = request_stats_5m.cache_creation_tokens + excluded.cache_creation_tokens,
+			cached_input_tokens = request_stats_5m.cached_input_tokens + excluded.cached_input_tokens,
+			reasoning_tokens = request_stats_5m.reasoning_tokens + excluded.reasoning_tokens,
+			input_cost_usd = request_stats_5m.input_cost_usd + excluded.input_cost_usd,
+			output_cost_usd = request_stats_5m.output_cost_usd + excluded.output_cost_usd,
+			cache_read_cost_usd = request_stats_5m.cache_read_cost_usd + excluded.cache_read_cost_usd,
+			cache_write_cost_usd = request_stats_5m.cache_write_cost_usd + excluded.cache_write_cost_usd,
+			sum_duration_ms = request_stats_5m.sum_duration_ms + excluded.sum_duration_ms,
+			sum_first_token_ms = request_stats_5m.sum_first_token_ms + excluded.sum_first_token_ms,
+			sum_generation_ms = request_stats_5m.sum_generation_ms + excluded.sum_generation_ms,
+			count_timed = request_stats_5m.count_timed + excluded.count_timed,
+			max_request_created_at = MAX(request_stats_5m.max_request_created_at, excluded.max_request_created_at),
+			created_at = excluded.created_at`,
+			row.BucketStart, row.RoutePrefix, row.RequestModel, row.APIKeyName,
+			row.Requests, row.Errors, row.Failovers, row.CacheHits, row.CacheCreates,
+			row.InputTokens, row.OutputTokens, row.CacheReadTokens, row.CacheCreateTokens,
+			row.CachedInputTokens, row.ReasoningTokens,
+			row.InputCostUSD, row.OutputCostUSD, row.CacheReadCostUSD, row.CacheWriteCostUSD,
+			row.SumDurationMs, row.SumFirstTokenMs, row.SumGenerationMs, row.CountTimed,
+			row.MaxRequestCreatedAt, row.CreatedAt,
+		).Error
+	}
 }
 
 // resolveModel returns the model id to roll up under: the upstream's actual

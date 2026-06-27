@@ -1,5 +1,7 @@
 # docker-compose for local development and self-contained deployment.
 # Brings up Postgres + the gateway together.
+# tail -f /var/log/llmrelay/llmrelay.log
+# tail -f /var/log/llmrelay/llmrelay.err.log
 services:
   postgres:
     image: postgres:17-alpine

@@ -7,6 +7,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
+	"github.com/taozhang/llmrelay/internal/db"
 	"github.com/taozhang/llmrelay/internal/pricing"
 	"github.com/taozhang/llmrelay/internal/schema"
 )
@@ -70,7 +71,7 @@ func TestRollupTick_Incremental(t *testing.T) {
 	cat := fakeCatalog{prices: map[string]*pricing.ModelPricing{
 		"gpt-4o": {Input: ptrFloat(5), Output: ptrFloat(15)},
 	}}
-	rollup := NewRollup(gdb, cat)
+	rollup := NewRollup(gdb, cat, db.DialectSQLite)
 
 	// Bucket base: 1000000 (a 5m boundary). Two requests in the first batch.
 	// completed_at must be monotonic since the rollup cursor tracks it.
@@ -128,7 +129,7 @@ func TestRollupTick_Incremental(t *testing.T) {
 // no-op (the cursor prevents re-processing).
 func TestRollupTick_Idempotent(t *testing.T) {
 	gdb := setupTestDB(t)
-	rollup := NewRollup(gdb, nil)
+	rollup := NewRollup(gdb, nil, db.DialectSQLite)
 
 	insertRequest(t, gdb, schema.ConsoleRequest{
 		RequestID: "r1", CreatedAt: 1000000, RoutePrefix: "x", RequestModel: "m",
@@ -151,7 +152,7 @@ func TestRollupTick_Idempotent(t *testing.T) {
 // catalog pricing still get counted but contribute 0 cost.
 func TestRollupTick_NoPricingSkipsCost(t *testing.T) {
 	gdb := setupTestDB(t)
-	rollup := NewRollup(gdb, nil) // nil catalog
+	rollup := NewRollup(gdb, nil, db.DialectSQLite) // nil catalog
 
 	insertRequest(t, gdb, schema.ConsoleRequest{
 		RequestID: "r1", CreatedAt: 1000000, RoutePrefix: "x", RequestModel: "unknown",
@@ -173,7 +174,7 @@ func TestRollupTick_NoPricingSkipsCost(t *testing.T) {
 // TestRollupTick_Dimensions verifies rows are split by route/model/client.
 func TestRollupTick_Dimensions(t *testing.T) {
 	gdb := setupTestDB(t)
-	rollup := NewRollup(gdb, nil)
+	rollup := NewRollup(gdb, nil, db.DialectSQLite)
 
 	insertRequest(t, gdb, schema.ConsoleRequest{RequestID: "r1", CreatedAt: 1000000, RoutePrefix: "a", RequestModel: "m1", APIKeyName: strPtr("c1")})
 	insertRequest(t, gdb, schema.ConsoleRequest{RequestID: "r2", CreatedAt: 1000000, RoutePrefix: "a", RequestModel: "m1", APIKeyName: strPtr("c2")})
