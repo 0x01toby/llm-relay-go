@@ -94,10 +94,9 @@ func (r *Runner) Run(ctx context.Context) Status {
 // — specifically the functional index backing the "tokens" sort on the request
 // list (ORDER BY input_tokens + output_tokens). Each statement is idempotent and
 // best-effort: a failure only logs, never blocks startup (the query still works,
-// just slower). Syntax is dialect-adapted: SQLite & Postgres accept CREATE INDEX
-// IF NOT EXISTS with a parenthesized expression; MySQL 8+ supports functional
-// indexes but not IF NOT EXISTS, so we rely on CREATE INDEX failing silently on
-// the duplicate.
+// just slower). SQLite & Postgres accept expression indexes. MariaDB does not
+// support MySQL 8's functional-index syntax, so the mysql path uses a portable
+// composite index over the two columns.
 func ensureIndexes(ctx context.Context, gdb *gorm.DB) {
 	dialect, _ := db.DetectDialect(gdb.Dialector.Name())
 	// GORM's Dialector.Name() returns the driver name; DetectDialect parses a
@@ -109,7 +108,7 @@ func ensureIndexes(ctx context.Context, gdb *gorm.DB) {
 			`CREATE INDEX IF NOT EXISTS idx_console_requests_tokens_sort ON console_requests ((input_tokens + output_tokens))`)
 	case strings.Contains(dn, "mysql"):
 		execIgnoreDup(ctx, gdb,
-			`CREATE INDEX idx_console_requests_tokens_sort ON console_requests ((input_tokens + output_tokens))`)
+			`CREATE INDEX idx_console_requests_tokens_sort ON console_requests (input_tokens, output_tokens)`)
 	}
 	_ = dialect
 }

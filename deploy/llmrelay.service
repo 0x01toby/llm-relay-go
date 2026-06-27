@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Relay Service (Go)
+After=network-online.target mariadb.service
+Wants=network-online.target
+Requires=mariadb.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/llm-relay-go
+EnvironmentFile=/root/llm-relay-go/.env
+Environment=PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/llm-relay-go/bin/llm-relay
+Restart=always
+RestartSec=3
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
