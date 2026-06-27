@@ -90,15 +90,19 @@ func (b *BlockReader) Next() (string, bool, error) {
 }
 
 // ExtractDataLines pulls the concatenated data payload out of an SSE block.
-// Lines beginning with "data: " have that prefix stripped; multi-line data
-// values are joined with "\n", mirroring the SSE spec. Returns "" if there
-// are no data lines.
+// Lines beginning with "data:" have that prefix stripped; one optional leading
+// space after the colon is ignored per the SSE spec. Multi-line data values are
+// joined with "\n". Returns "" if there are no data lines.
 func ExtractDataLines(block string) string {
 	var parts []string
 	for _, line := range strings.Split(block, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(line, "data: ") {
-			parts = append(parts, line[len("data: "):])
+		if strings.HasPrefix(line, "data:") {
+			data := line[len("data:"):]
+			if strings.HasPrefix(data, " ") {
+				data = data[1:]
+			}
+			parts = append(parts, data)
 		}
 	}
 	return strings.Join(parts, "\n")

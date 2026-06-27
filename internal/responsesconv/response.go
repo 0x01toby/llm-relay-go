@@ -148,6 +148,19 @@ func extractChatMessageTextContent(content interface{}) string {
 	return ""
 }
 
+func extractChatMessageVisibleText(message Obj) string {
+	if text := extractChatMessageTextContent(message["content"]); text != "" {
+		return text
+	}
+	// Kimi Coding streams and returns visible text in reasoning_content while
+	// leaving content empty. Treat it as output text so Responses clients do not
+	// receive an empty completed response.
+	if text, ok := strField(message, "reasoning_content"); ok {
+		return text
+	}
+	return ""
+}
+
 // convertChatMessageToResponseItems builds the output items for a single chat
 // message, splitting <think> tags into reasoning/message items.
 func convertChatMessageToResponseItems(message Obj, responseID string) []Obj {
@@ -167,7 +180,7 @@ func convertChatMessageToResponseItems(message Obj, responseID string) []Obj {
 	if annotations == nil {
 		annotations = Arr{}
 	}
-	segments := splitThinkTaggedText(extractChatMessageTextContent(message["content"]))
+	segments := splitThinkTaggedText(extractChatMessageVisibleText(message))
 
 	out := make([]Obj, 0, len(segments))
 	for i, seg := range segments {

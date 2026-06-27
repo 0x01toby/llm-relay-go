@@ -67,8 +67,8 @@ func decodeAny(t *testing.T, s string) interface{} {
 
 func TestConvertResponsesRequest_BasicFlow(t *testing.T) {
 	input := jsonStr(t, Obj{
-		"model":         "gpt-test",
-		"instructions":  "Be concise.",
+		"model":             "gpt-test",
+		"instructions":      "Be concise.",
 		"max_output_tokens": 42,
 		"input": Arr{
 			Obj{"role": "user", "content": Arr{Obj{"type": "input_text", "text": "Return JSON."}}},
@@ -85,7 +85,7 @@ func TestConvertResponsesRequest_BasicFlow(t *testing.T) {
 				"required":   Arr{"answer"},
 			},
 		}},
-		"tools": Arr{Obj{"type": "function", "name": "lookup", "parameters": Obj{"type": "object"}}},
+		"tools":       Arr{Obj{"type": "function", "name": "lookup", "parameters": Obj{"type": "object"}}},
 		"tool_choice": Obj{"type": "function", "name": "lookup"},
 		"stream":      true,
 	})
@@ -186,9 +186,9 @@ func TestConvertResponsesRequest_MiniMaxSanitization(t *testing.T) {
 		},
 		"tools": Arr{
 			Obj{"type": "function", "name": "exec_command", "strict": false, "parameters": Obj{
-				"type": "object",
-				"properties": Obj{"cmd": Obj{"type": "string"}},
-				"required":           Arr{"cmd"},
+				"type":                 "object",
+				"properties":           Obj{"cmd": Obj{"type": "string"}},
+				"required":             Arr{"cmd"},
 				"additionalProperties": false,
 			}},
 			Obj{"type": "web_search"},
@@ -245,27 +245,27 @@ func TestConvertResponsesRequest_MiniMaxSanitization(t *testing.T) {
 
 func TestConvertChatCompletion_NonStreaming(t *testing.T) {
 	cc := Obj{
-		"id":     "chatcmpl_123",
-		"object": "chat.completion",
+		"id":      "chatcmpl_123",
+		"object":  "chat.completion",
 		"created": float64(123),
-		"model":  "gpt-test",
+		"model":   "gpt-test",
 		"choices": Arr{Obj{
 			"index": float64(0),
 			"message": Obj{
 				"role":    "assistant",
 				"content": "Hello",
 				"tool_calls": Arr{Obj{
-					"id":   "call_1",
-					"type": "function",
+					"id":       "call_1",
+					"type":     "function",
 					"function": Obj{"name": "lookup", "arguments": `{"q":"x"}`},
 				}},
 			},
 			"finish_reason": "stop",
 		}},
 		"usage": Obj{
-			"prompt_tokens":     float64(10),
-			"completion_tokens": float64(4),
-			"total_tokens":      float64(14),
+			"prompt_tokens":             float64(10),
+			"completion_tokens":         float64(4),
+			"total_tokens":              float64(14),
 			"prompt_tokens_details":     Obj{"cached_tokens": float64(6)},
 			"completion_tokens_details": Obj{"reasoning_tokens": float64(2)},
 		},
@@ -305,10 +305,10 @@ func TestConvertChatCompletion_NonStreaming(t *testing.T) {
 
 func TestConvertChatCompletion_ThinkTagSplitting(t *testing.T) {
 	cc := Obj{
-		"id":     "chatcmpl_think",
-		"object": "chat.completion",
+		"id":      "chatcmpl_think",
+		"object":  "chat.completion",
 		"created": float64(321),
-		"model":  "gpt-test",
+		"model":   "gpt-test",
 		"choices": Arr{Obj{
 			"message": Obj{
 				"role":    "assistant",
@@ -334,6 +334,35 @@ func TestConvertChatCompletion_ThinkTagSplitting(t *testing.T) {
 	second := toObj(output[1])
 	if second["id"] != "msg_chatcmpl_think_1" || second["type"] != "message" || second["role"] != "assistant" {
 		t.Errorf("output[1]: %s", jsonStr(t, second))
+	}
+}
+
+func TestConvertChatCompletion_ReasoningContentFallback(t *testing.T) {
+	cc := Obj{
+		"id":      "chatcmpl_kimi",
+		"created": float64(123),
+		"model":   "kimi-for-coding",
+		"choices": Arr{Obj{
+			"message": Obj{
+				"role":              "assistant",
+				"content":           "",
+				"reasoning_content": "1+1等于2。",
+			},
+			"finish_reason": "stop",
+		}},
+	}
+	out, err := ConvertChatCompletionToResponsePayload(cc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := decodeObj(t, out)
+	if resp["output_text"] != "1+1等于2。" {
+		t.Errorf("output_text: got %v", resp["output_text"])
+	}
+	first := toObj(toArr(resp["output"])[0])
+	part := toObj(toArr(first["content"])[0])
+	if part["text"] != "1+1等于2。" {
+		t.Errorf("fallback text: got %v", part["text"])
 	}
 }
 
@@ -439,6 +468,38 @@ func TestTransformResponse_ThinkStreaming(t *testing.T) {
 	second := toObj(output[1])
 	if second["id"] != "msg_chatcmpl_think_stream_1" || second["type"] != "message" || second["role"] != "assistant" {
 		t.Errorf("output[1]: %s", jsonStr(t, second))
+	}
+}
+
+func TestTransformResponse_ReasoningContentStreamingFallback(t *testing.T) {
+	chatSSE := strings.Join([]string{
+		`data:{"id":"chatcmpl_kimi_stream","object":"chat.completion.chunk","created":789,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}`,
+		``,
+		`data:{"id":"chatcmpl_kimi_stream","object":"chat.completion.chunk","created":789,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"reasoning_content":"1+1"},"finish_reason":null}]}`,
+		``,
+		`data:{"id":"chatcmpl_kimi_stream","object":"chat.completion.chunk","created":789,"model":"kimi-for-coding","choices":[{"index":0,"delta":{"reasoning_content":"等于2。"},"finish_reason":null}]}`,
+		``,
+		`data:{"id":"chatcmpl_kimi_stream","object":"chat.completion.chunk","created":789,"model":"kimi-for-coding","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	resp := TransformResponse(&http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(chatSSE)),
+	})
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+
+	if !strings.Contains(text, `"delta":"1+1"`) || !strings.Contains(text, `"delta":"等于2。"`) {
+		t.Errorf("missing reasoning_content fallback deltas:\n%s", text)
+	}
+	completed := parseSseEvent(t, text, "response.completed")
+	respObj := toObj(completed["response"])
+	if respObj["output_text"] != "1+1等于2。" {
+		t.Errorf("output_text: got %v", respObj["output_text"])
 	}
 }
 

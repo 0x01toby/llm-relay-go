@@ -357,6 +357,11 @@ func processChatCompletionChunk(em emitter, st *streamState, chunk Obj) {
 		}
 		contentDelta, ok := strField(delta, "content")
 		if !ok || contentDelta == "" {
+			// Kimi Coding emits text in reasoning_content and keeps content
+			// null/empty. Surface it as output text for Responses clients.
+			contentDelta, ok = strField(delta, "reasoning_content")
+		}
+		if !ok || contentDelta == "" {
 			continue
 		}
 		for _, seg := range st.thinkParser.consume(contentDelta) {
@@ -460,8 +465,12 @@ func sseDataLines(block string) string {
 	var parts []string
 	for _, line := range strings.Split(block, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(line, "data: ") {
-			parts = append(parts, line[len("data: "):])
+		if strings.HasPrefix(line, "data:") {
+			data := line[len("data:"):]
+			if strings.HasPrefix(data, " ") {
+				data = data[1:]
+			}
+			parts = append(parts, data)
 		}
 	}
 	return strings.Join(parts, "\n")
